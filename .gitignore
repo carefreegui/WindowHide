@@ -3,3 +3,4 @@ __pycache__/
 tests/probe_state.json
 tests/audio_probe_state.json
 windowhide.log
+.workbuddy/
