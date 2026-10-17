@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+tests/probe_state.json
+tests/audio_probe_state.json
+windowhide.log
