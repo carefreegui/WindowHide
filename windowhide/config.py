@@ -32,7 +32,7 @@ class HotkeySpec:
         return cls(mods=int(d.get("mods", 0)), vk=int(d.get("vk", 0)))
 
 
-def _app_dir() -> Path:
+def app_dir() -> Path:
     base = os.environ.get("APPDATA")
     if base:
         p = Path(base) / "WindowHide"
@@ -98,7 +98,7 @@ class Config:
         return c
 
     def save(self) -> None:
-        path = _app_dir() / "config.json"
+        path = app_dir() / "config.json"
         tmp = path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -108,7 +108,7 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        path = _app_dir() / "config.json"
+        path = app_dir() / "config.json"
         try:
             return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError, ValueError):

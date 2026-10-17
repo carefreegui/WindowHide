@@ -266,8 +266,13 @@ class MainWindow(QMainWindow):
             self._controller.hide_foreground()
 
     def _on_hotkey_failed(self, actions: str) -> None:
-        self.statusBar().showMessage(
-            f"警告:以下热键注册失败(可能被其它软件占用),请在设置中更换组合: {actions}")
+        # 状态栏消息一闪而过,用户根本注意不到(曾因此以为"快捷键坏了")。
+        # 气泡提示 + 日志双管齐下。
+        msg = (f"以下热键注册失败(可能被其它软件占用),请在设置中更换组合: {actions}")
+        self.statusBar().showMessage("警告:" + msg)
+        self._tray.showMessage("快捷键注册失败", msg)
+        from ..log import write
+        write("界面提示: " + msg)
 
     def _on_action(self, action: str, count: int) -> None:
         self.refresh()

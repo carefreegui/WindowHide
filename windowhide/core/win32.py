@@ -178,6 +178,10 @@ RegisterClassW = user32.RegisterClassW
 RegisterClassW.argtypes = [ctypes.c_void_p]
 RegisterClassW.restype = wintypes.ATOM
 
+UnregisterClassW = user32.UnregisterClassW
+UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+UnregisterClassW.restype = wintypes.BOOL
+
 CreateWindowExW = user32.CreateWindowExW
 CreateWindowExW.argtypes = [
     wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,

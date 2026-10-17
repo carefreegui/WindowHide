@@ -3,10 +3,17 @@
 隐藏 = 窗口从任务栏和 Alt+Tab 消失(SW_HIDE + WS_EX_TOOLWINDOW),
       程序继续在后台运行;同时尽力移除其托盘图标。
 恢复 = 还原样式与显示状态,取消静音,广播 TaskbarCreated 让托盘图标回来。
+
+隐藏状态会持久化到 %APPDATA%/WindowHide/hidden_state.json:
+本工具重启/崩溃后,被隐藏的窗口不会变成"孤儿"(任务栏没有、界面里也
+恢复不了),启动时自动恢复状态,用户照常点恢复即可。
 """
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -14,6 +21,12 @@ from . import win32
 from .audio import set_process_mute
 from .targets import TargetRule
 from .trayhide import delete_process_tray_icons, request_tray_icon_restore
+
+
+def _state_path() -> Path:
+    base = os.environ.get("APPDATA")
+    root = Path(base) / "WindowHide" if base else Path(__file__).resolve().parent.parent.parent
+    return root / "hidden_state.json"
 
 
 @dataclass(slots=True)
@@ -51,6 +64,61 @@ class HideController(QObject):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._watch)
         self._timer.start()
+        self._load_state()
+
+    # ------------------------------------------------------------ 状态持久化
+    def _save_state(self) -> None:
+        data = {"version": 1, "hidden": [
+            {"pid": hp.pid, "process_name": hp.process_name, "muted": hp.muted,
+             "records": [{"hwnd": r.hwnd, "ex_style": r.ex_style,
+                          "show_cmd": r.show_cmd, "title": r.title}
+                         for r in hp.records.values()]}
+            for hp in self._hidden.values()
+        ]}
+        try:
+            _state_path().write_text(json.dumps(data, ensure_ascii=False),
+                                     encoding="utf-8")
+        except OSError:
+            pass
+
+    def _load_state(self) -> None:
+        """从磁盘恢复隐藏状态;逐项校验,过期/已被恢复的一律丢弃。"""
+        try:
+            data = json.loads(_state_path().read_text(encoding="utf-8"))
+        except Exception:
+            return
+        loaded = 0
+        for entry in data.get("hidden", []):
+            try:
+                pid = int(entry["pid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not win32.process_is_alive(pid):
+                continue
+            hp = HiddenProcess(pid=pid,
+                               process_name=str(entry.get("process_name", "")),
+                               muted=bool(entry.get("muted", False)))
+            for rec in entry.get("records", []):
+                try:
+                    hwnd = int(rec["hwnd"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not win32.IsWindow(hwnd):
+                    continue
+                if win32.get_window_pid(hwnd) != pid:
+                    continue          # 句柄已被回收给别的窗口
+                if win32.IsWindowVisible(hwnd):
+                    continue          # 已经重新显示了,不是我们隐藏的状态
+                if not (win32.get_window_styles(hwnd)[1] & win32.WS_EX_TOOLWINDOW):
+                    continue          # 没有我们加的工具窗样式
+                hp.records[hwnd] = WindowRecord(
+                    hwnd, int(rec.get("ex_style", 0)),
+                    int(rec.get("show_cmd", 9)), str(rec.get("title", "")))
+            if hp.records:
+                self._hidden[pid] = hp
+                loaded += 1
+        if loaded:
+            self.state_changed.emit()
 
     # ------------------------------------------------------------ 查询
     def hidden_pids(self) -> list[int]:
@@ -84,6 +152,7 @@ class HideController(QObject):
                 self._hidden[pid] = hp
                 done += 1
         if done:
+            self._save_state()
             self.state_changed.emit()
             self.action_done.emit("hidden", done)
         return done
@@ -139,6 +208,7 @@ class HideController(QObject):
             self._restore_one(hp)
             done += 1
         if done:
+            self._save_state()
             self.state_changed.emit()
             self.action_done.emit("restored", done)
         return done
@@ -207,4 +277,5 @@ class HideController(QObject):
                     hp.records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title)
                 dirty = True
         if dirty:
+            self._save_state()
             self.state_changed.emit()
