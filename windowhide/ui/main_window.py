@@ -71,7 +71,8 @@ class MainWindow(QMainWindow):
 
         self._btn_refresh = QPushButton("刷新")
         self._btn_hide = QPushButton("隐藏勾选")
-        self._btn_hide.setDefault(True)
+        # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
+        # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
         self._btn_restore = QPushButton("恢复全部")
         self._btn_toggle = QPushButton("切换")
         self._btn_save_target = QPushButton("保存为目标")

@@ -54,10 +54,13 @@ def _badge_icon(color: str) -> QIcon:
 
 
 class WindowTable(QTableWidget):
-    row_activated = Signal(int)   # 双击行 -> hwnd
+    row_activated = Signal(int)   # 双击行(复选框列除外) -> hwnd
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._hwnds: list[int] = []
+        self._checked: set[int] = set()   # 勾选状态按 hwnd 保存,跨刷新保留
+        self._syncing = False             # 重建表格时为真,避免 itemChanged 干扰
         self.setColumnCount(6)
         self.setHorizontalHeaderLabels(["", "应用", "窗口标题", "类型", "状态", "PID"])
         self.verticalHeader().setVisible(False)
@@ -79,20 +82,51 @@ class WindowTable(QTableWidget):
         self.setColumnWidth(COL_STATUS, 70)
         self.setColumnWidth(COL_PID, 64)
         self.itemDoubleClicked.connect(self._on_double_click)
+        self.itemChanged.connect(self._on_item_changed)
+
+    def _on_item_changed(self, item) -> None:
+        """用户点击复选框 -> 同步进 _checked,刷新后才能恢复。"""
+        if self._syncing or item.column() != COL_CHECK:
+            return
+        row = item.row()
+        if not (0 <= row < len(self._hwnds)):
+            return
+        hwnd = self._hwnds[row]
+        if item.checkState() == Qt.Checked:
+            self._checked.add(hwnd)
+        else:
+            self._checked.discard(hwnd)
 
     def refresh(self, windows: list[WindowInfo], hidden_hwnds: set[int],
                 our_pid: int) -> None:
+        # 定时器每 1.5s 会整体重建表格;勾选状态和滚动位置必须保留,
+        # 否则用户刚勾的窗口下一秒就被取消,根本没法累积选择。
+        old_checked = self._checked
+        scroll = self.verticalScrollBar().value()
+
+        self._syncing = True
+        try:
+            self._rebuild_rows(windows, hidden_hwnds, our_pid, old_checked)
+        finally:
+            self._syncing = False
+        self.verticalScrollBar().setValue(scroll)
+
+    def _rebuild_rows(self, windows, hidden_hwnds, our_pid, old_checked) -> None:
         self.setRowCount(0)
-        self._hwnds: list[int] = []
+        self._hwnds = []
+        self._checked = set()
         for win in sorted(windows, key=lambda w: (w.process_name.lower(), w.title.lower())):
             row = self.rowCount()
             self.insertRow(row)
             self._hwnds.append(win.hwnd)
+            checked = win.hwnd in old_checked
+            if checked:
+                self._checked.add(win.hwnd)
 
             # 勾选
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-            chk.setCheckState(Qt.Unchecked)
+            chk.setCheckState(Qt.Checked if checked else Qt.Unchecked)
             chk.setTextAlignment(Qt.AlignCenter)
             self.setItem(row, COL_CHECK, chk)
 
@@ -128,6 +162,10 @@ class WindowTable(QTableWidget):
                     item = self.item(row, col)
                     if item:
                         item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                        if col == COL_CHECK and win.hwnd in self._checked:
+                            # 本工具自己的窗口不允许勾选
+                            self._checked.discard(win.hwnd)
+                            item.setCheckState(Qt.Unchecked)
 
     @staticmethod
     def _win_type(win: WindowInfo) -> str:
@@ -146,19 +184,33 @@ class WindowTable(QTableWidget):
         for row in range(self.rowCount()):
             item = self.item(row, COL_CHECK)
             if item and (item.flags() & Qt.ItemIsEnabled):
+                hwnd = self._hwnds[row]
+                if checked:
+                    self._checked.add(hwnd)
+                else:
+                    self._checked.discard(hwnd)
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
 
     def invert_checked(self) -> None:
         for row in range(self.rowCount()):
             item = self.item(row, COL_CHECK)
             if item and (item.flags() & Qt.ItemIsEnabled):
-                item.setCheckState(
-                    Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+                hwnd = self._hwnds[row]
+                if item.checkState() == Qt.Checked:
+                    self._checked.discard(hwnd)
+                    item.setCheckState(Qt.Unchecked)
+                else:
+                    self._checked.add(hwnd)
+                    item.setCheckState(Qt.Checked)
 
     def selected_hwnds(self) -> list[int]:
         return [self._hwnds[r] for r in sorted({i.row() for i in self.selectedItems()})]
 
     def _on_double_click(self, item: QTableWidgetItem) -> None:
+        # 复选框列上的双击就是勾选操作本身,不能再触发"切换隐藏"——
+        # 否则快速点击两下复选框会先把窗口隐藏掉,误触严重。
+        if item.column() == COL_CHECK:
+            return
         row = item.row()
         if 0 <= row < len(self._hwnds):
             self.row_activated.emit(self._hwnds[row])
