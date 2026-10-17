@@ -130,6 +130,18 @@ SendMessageW = user32.SendMessageW
 SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 SendMessageW.restype = wintypes.LPARAM
 
+# 带超时的发送:目标线程无响应时最多等 timeout 毫秒,不会无限期阻塞调用方
+SendMessageTimeoutW = user32.SendMessageTimeoutW
+SendMessageTimeoutW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.ULONG),
+]
+SendMessageTimeoutW.restype = wintypes.LPARAM
+
+WM_GETTEXT = 0x000D
+SMTO_ABORTIFHUNG = 0x0002
+SEND_MSG_TIMEOUT_MS = 100
+
 PostMessageW = user32.PostMessageW
 PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 PostMessageW.restype = wintypes.BOOL
@@ -267,8 +279,18 @@ class WindowInfo:
 
 # ---------------------------------------------------------------- 基础函数
 def get_window_text(hwnd: int) -> str:
+    """取窗口标题。
+
+    必须用带超时的 SendMessageTimeoutW 而不是 GetWindowTextW:
+    GetWindowTextW 内部向目标窗口所在线程发 WM_GETTEXT,遇到无响应的
+    进程会无限期阻塞调用方(曾导致隐藏操作整个卡死)。
+    """
     buf = ctypes.create_unicode_buffer(512)
-    n = GetWindowTextW(hwnd, buf, 512)
+    result = wintypes.ULONG(0)
+    n = SendMessageTimeoutW(hwnd, WM_GETTEXT, 512,
+                            ctypes.cast(buf, ctypes.c_void_p).value,
+                            SMTO_ABORTIFHUNG, SEND_MSG_TIMEOUT_MS,
+                            ctypes.byref(result))
     return buf.value if n > 0 else ""
 
 
@@ -332,8 +354,12 @@ def process_is_alive(pid: int) -> bool:
         CloseHandle(h)
 
 
-def enum_top_level_windows() -> list[WindowInfo]:
-    """枚举所有顶层窗口(parent==0),包含隐藏窗口。"""
+def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
+    """枚举所有顶层窗口(parent==0),包含隐藏窗口。
+
+    pid 非 None 时只收集该进程的窗口 —— 在回调里就按 pid 过滤,
+    避免对全系统窗口逐个取标题(既慢又会放大无响应窗口的影响面)。
+    """
     result: list[WindowInfo] = []
 
     @WNDENUMPROC
@@ -343,6 +369,8 @@ def enum_top_level_windows() -> list[WindowInfo]:
         # 注意:GetParent 的 restype 是 HWND(c_void_p),无父窗口时返回 None
         if GetParent(hwnd):
             return True  # 只收顶层
+        if pid is not None and get_window_pid(hwnd) != pid:
+            return True
         try:
             style, ex_style = get_window_styles(hwnd)
             result.append(WindowInfo(
@@ -366,7 +394,7 @@ def enum_top_level_windows() -> list[WindowInfo]:
 
 def enum_process_windows(pid: int) -> list[WindowInfo]:
     """枚举指定进程的所有顶层窗口(含隐藏、无标题的托盘回调窗口)。"""
-    return [w for w in enum_top_level_windows() if w.pid == pid]
+    return enum_top_level_windows(pid)
 
 
 def enum_process_windows_all(pid: int) -> list[WindowInfo]:
@@ -382,6 +410,8 @@ def enum_process_windows_all(pid: int) -> list[WindowInfo]:
     def _collect(hwnd: int) -> None:
         if hwnd in seen or not IsWindow(hwnd):
             return
+        if get_window_pid(hwnd) != pid:
+            return  # 先按 pid 过滤,只对目标进程的窗口取标题等详情
         seen.add(hwnd)
         try:
             style, ex_style = get_window_styles(hwnd)

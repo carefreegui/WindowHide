@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QStatusBar, QVBoxLayout, QWidget,
+    QPushButton, QStatusBar, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from ..config import Config

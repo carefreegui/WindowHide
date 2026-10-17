@@ -82,8 +82,11 @@ windowhide/
     ├── smoke_test.py         # 冒烟测试(枚举/分类/配置/托盘通路)
     ├── integration_test.py   # 真实窗口隐藏恢复 + 托盘移除恢复 + 热键模拟
     ├── audio_test.py         # 静音功能测试(播音探针 + 静音/取消/状态查询)
+    ├── tray_click_test.py    # 托盘点击切换链路(进程内真实 MainWindow)
+    ├── hang_test.py          # 无响应窗口不阻塞测试(挂起探针)
     ├── gui_e2e.py            # GUI 端到端(启动真实程序,按键验证隐藏恢复)
     ├── dummy_app.py          # 测试专用假目标窗口
+    ├── hang_probe.py         # 无响应窗口探针(测试辅助)
     ├── tray_probe.py         # 托盘图标探针(测试辅助)
     ├── audio_probe.py        # 播音探针(测试辅助)
     └── screenshot.py         # 纯 ctypes 截屏(全屏/PrintWindow 窗口)
@@ -111,6 +114,13 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 在 vtable 索引 5(前面有两个方法),`IAudioSessionControl2::GetProcessId`
 在索引 14(前面有 11 个方法)。*
 
+**窗口枚举必须防挂起** `GetWindowTextW` / `WM_GETICON` 都是跨线程
+`SendMessage`,遇到"无响应"进程的窗口会**无限期阻塞调用方** —— 曾导致
+点击隐藏后整个工具卡死(栈停在 `get_window_text`)。现在统一改用
+`SendMessageTimeoutW`(`SMTO_ABORTIFHUNG`,100ms 超时),挂起窗口的标题
+降级为空串,不影响其它窗口;枚举时也先按 pid 过滤再取详情,
+避免对全系统窗口逐个发消息。
+
 **热键** 独立线程建消息窗口 + `RegisterHotKey`,`MOD_NOREPEAT` 防连发;
 收到 `WM_HOTKEY` 后通过 Qt 信号转主线程执行,响应延迟在毫秒级。
 
@@ -120,6 +130,8 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 python tests/smoke_test.py        # 冒烟:枚举/分类/配置/托盘通路
 python tests/integration_test.py  # 集成:测试窗口隐藏恢复 + 托盘移除恢复 + 热键
 python tests/audio_test.py        # 静音:播音探针静音/取消/状态查询
+python tests/tray_click_test.py   # 托盘点击切换链路(进程内真实界面)
+python tests/hang_test.py         # 无响应窗口不阻塞(挂起探针)
 python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探测空闲热键按键验证
 ```
 
@@ -130,6 +142,8 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 | 冒烟(枚举/分类/配置/托盘通路自检) | 全部通过 |
 | 集成(隐藏/恢复/样式还原/托盘删除与重注册/热键触发) | 11/11 通过 |
 | 静音(静音→取消→状态查询) | 全部通过 |
+| 托盘点击切换(曾因漏导入失效,现有回归测试) | 全部通过 |
+| 无响应窗口不阻塞 | 全部通过 |
 | GUI 端到端(热键 Ctrl+Alt+F8 切换隐藏/恢复) | 通过 |
 
 集成测试会真实操作桌面(自动启动/关闭测试窗口与探针、模拟按键),

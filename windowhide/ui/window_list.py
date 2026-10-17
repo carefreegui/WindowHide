@@ -1,24 +1,38 @@
 """window_list.py - 窗口列表表格。"""
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 
 from ..core.classify import type_label, type_color
-from ..core.win32 import WindowInfo, WM_GETICON, SendMessageW, user32
+from ..core.win32 import (
+    WindowInfo, WM_GETICON, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+    SEND_MSG_TIMEOUT_MS,
+)
 
 COL_CHECK, COL_APP, COL_TITLE, COL_TYPE, COL_STATUS, COL_PID = range(6)
 
 _STATE_LABELS = {True: "已隐藏", False: "显示中"}
 
 
+def _get_icon_handle(hwnd: int, size: int) -> int:
+    """带超时地取窗口图标句柄(WM_GETICON 也是跨线程发送,会阻塞)。"""
+    result = wintypes.ULONG(0)
+    return int(SendMessageTimeoutW(hwnd, WM_GETICON, size, 0,
+                                   SMTO_ABORTIFHUNG, SEND_MSG_TIMEOUT_MS,
+                                   ctypes.byref(result)) or 0)
+
+
 def _icon_for_window(win: WindowInfo) -> QIcon | None:
     """尽量取窗口自身的图标;取不到就用类型色块。"""
     try:
-        hicon = SendMessageW(win.hwnd, WM_GETICON, 1, 0) or SendMessageW(win.hwnd, WM_GETICON, 0, 0)
+        hicon = _get_icon_handle(win.hwnd, 1) or _get_icon_handle(win.hwnd, 0)
         if hicon:
-            pix = QPixmap.fromWinHICON(int(hicon))
+            pix = QPixmap.fromWinHICON(hicon)
             if not pix.isNull():
                 return QIcon(pix)
     except Exception:
