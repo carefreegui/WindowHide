@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -334,6 +335,13 @@ GetWindowPlacement = user32.GetWindowPlacement
 GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
 GetWindowPlacement.restype = wintypes.BOOL
 
+# SetWindowPlacement 是跨进程"把窗口从最小化拉回来"最可靠的一招:
+# 它直接改窗口的显示状态与还原矩形,不依赖目标程序配合处理 WM_SHOWWINDOW。
+# (实测永劫无间:ShowWindow(SW_SHOWNORMAL) 发了没反应,走这个能回来)
+SetWindowPlacement = user32.SetWindowPlacement
+SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+SetWindowPlacement.restype = wintypes.BOOL
+
 
 # ---------------------------------------------------------------- 数据结构
 @dataclass(slots=True)
@@ -447,6 +455,27 @@ def process_is_alive(pid: int) -> bool:
         return False
     finally:
         CloseHandle(h)
+
+
+def process_is_higher_integrity(pid: int) -> bool:
+    """目标进程权限是否比本进程高(UIPI 会静默吃掉所有窗口操作)。
+
+    `PROCESS_VM_READ` 是受完整性级别检查的权限:普通权限进程拿管理员权限
+    进程的这个权限必然得到 ACCESS_DENIED。
+
+    为什么必须在动手前问这一句(用户实测踩的坑):永劫无间以管理员权限
+    运行时,`SetWindowLongPtrW`(加 TOOLWINDOW)、`SetWindowPlacement`
+    (拉回窗口)全部静默失败,只有 `ShowWindowAsync(SW_MINIMIZE)` 生效 ——
+    结果就是把窗口最小化成"没有任务栏按钮、Alt+Tab 也没有"的状态,
+    用户再也点不回来,游戏卡死。宁可不藏,也不能把窗口丢在这个状态里。
+    """
+    if pid == os.getpid():
+        return False
+    h = OpenProcess(PROCESS_VM_READ, False, pid)
+    if h:
+        CloseHandle(h)
+        return False
+    return GetLastError() == ERROR_ACCESS_DENIED
 
 
 def process_descendants(pid: int) -> set[int]:
@@ -637,6 +666,41 @@ def is_offscreen(hwnd: int) -> bool:
     return bool(IsIconic(hwnd))
 
 
+def set_placement_cmd(hwnd: int, show_cmd: int) -> bool:
+    """直接把窗口的显示状态改成 show_cmd(SetWindowPlacement)。
+
+    比 `ShowWindow` 可靠的地方:不依赖目标程序处理 `WM_SHOWWINDOW`,
+    是真正改窗口放置状态。对"被最小化的全屏游戏"这是唯一拉得回来的招
+    (实测:永劫无间对 `ShowWindow(SW_SHOWNORMAL)` 完全没反应)。
+    """
+    wp = WINDOWPLACEMENT()
+    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+    if not GetWindowPlacement(hwnd, ctypes.byref(wp)):
+        return False
+    wp.showCmd = show_cmd
+    return bool(SetWindowPlacement(hwnd, ctypes.byref(wp)))
+
+
+def force_foreground(hwnd: int) -> None:
+    """把窗口抢到前台并置顶。
+
+    后台进程直接 `SetForegroundWindow` 常被系统拒绝(前台锁),
+    标准绕法是 AttachThreadInput 把自己的输入队列接到当前前台线程上。
+    """
+    fg = GetForegroundWindow()
+    t_fg = GetWindowThreadProcessId(fg, None) if fg else 0
+    t_self = kernel32.GetCurrentThreadId()
+    attached = False
+    try:
+        if t_fg and t_fg != t_self:
+            attached = bool(user32.AttachThreadInput(t_self, t_fg, True))
+        user32.BringWindowToTop(wintypes.HWND(hwnd))
+        SetForegroundWindow(wintypes.HWND(hwnd))
+    finally:
+        if attached:
+            user32.AttachThreadInput(t_self, t_fg, False)
+
+
 def hide_plan(hwnd: int) -> str:
     """隐藏策略。全屏窗口必须"先最小化、再隐藏",其它窗口直接隐藏。
 
@@ -687,7 +751,16 @@ def hide_window(hwnd: int) -> tuple[int, int]:
         minimize_window(hwnd)
         _wait_offscreen(hwnd, 0.8)      # 等它真的掉出独占全屏
         ShowWindowAsync(hwnd, SW_HIDE)  # 退出全屏后隐藏才有效
+        SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOACTIVATE | SWP_HIDEWINDOW)
         _wait_offscreen(hwnd, 0.3)
+        if IsWindowVisible(hwnd) and IsIconic(hwnd):
+            # 最小化生效了、隐藏没生效 = 半残状态:窗口在最小化里,而
+            # WS_POPUP 的游戏窗口没有任务栏按钮、也不在 Alt+Tab 里,
+            # 用户根本点不回来(永劫无间实测就是这么卡死的)。
+            # 全有或全无 —— 撤回到原样,让上层如实报"没藏掉"。
+            _undo_hide(hwnd, ex_style, show_cmd)
         return ex_style, show_cmd
 
     ShowWindow(hwnd, SW_HIDE)
@@ -700,6 +773,13 @@ def hide_window(hwnd: int) -> tuple[int, int]:
     return ex_style, show_cmd
 
 
+def _undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
+    """把没藏干净的操作撤回原样(去样式 + 拉回显示)。"""
+    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW, add=ex_style & WS_EX_TOOLWINDOW)
+    if not set_placement_cmd(hwnd, SW_SHOWNORMAL):
+        ShowWindowAsync(hwnd, SW_RESTORE)
+
+
 def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
     """恢复窗口:还原扩展样式,再按记录的命令显示。"""
     set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW, add=ex_style & WS_EX_TOOLWINDOW)
@@ -710,7 +790,12 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
         cmd = SW_RESTORE  # 原来是最小化的,恢复成普通显示
     elif cmd in (SW_SHOWNOACTIVATE, SW_SHOWNA):
         cmd = SW_SHOWNOACTIVATE
-    ShowWindow(hwnd, cmd)
+    # 优先用 SetWindowPlacement 直接改状态:被最小化的全屏游戏对
+    # ShowWindow(SW_SHOWNORMAL) 可能毫无反应(实测永劫无间)。
+    if not set_placement_cmd(hwnd, cmd):
+        # 退路用异步版:同步 ShowWindow 跨进程要等目标线程,
+        # 游戏主循环一卡就把本工具的 UI 冻住。
+        ShowWindowAsync(hwnd, cmd)
 
 
 def is_hidden(hwnd: int) -> bool:

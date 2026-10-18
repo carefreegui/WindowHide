@@ -15,6 +15,7 @@ WS_VISIBLE —— SW_HIDE 掉窗口也没用。修复办法是对全屏窗口改
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -144,7 +145,26 @@ def main() -> int:
         win32.hide_window = real_hide
         controller.restore_all()
 
-    print("== 5. 收尾 ==")
+    print("== 5. 权限预检(UIPI)与半残回滚 ==")
+    # 目标进程权限比我们高时,UIPI 会把窗口操作静默吃掉。System(pid=4)
+    # 是高完整性进程,用它验证检测器能认出来;然后确认自己不会被误判。
+    check("自己能正常操作(不被误判为高权限)",
+          not win32.process_is_higher_integrity(os.getpid()))
+    check("System(pid=4) 被判为高权限", win32.process_is_higher_integrity(4))
+
+    # 回滚:模拟"最小化成功、隐藏失败"的半残状态,必须能撤回原样
+    win32.set_ex_style(fs.hwnd, add=win32.WS_EX_TOOLWINDOW)
+    win32.minimize_window(fs.hwnd)
+    time.sleep(0.3)
+    check("先真的最小化", bool(win32.IsIconic(fs.hwnd)))
+    win32._undo_hide(fs.hwnd, 0x00040008, win32.SW_SHOWNORMAL)
+    time.sleep(0.5)
+    check("回滚后不再最小化", not win32.IsIconic(fs.hwnd))
+    check("回滚后重新可见", bool(win32.IsWindowVisible(fs.hwnd)))
+    check("回滚后 TOOLWINDOW 已移除",
+          not (win32.get_window_styles(fs.hwnd)[1] & win32.WS_EX_TOOLWINDOW))
+
+    print("== 6. 收尾 ==")
     controller.restore_all()
     controller._timer.stop()
     for p in (fs_proc, normal_proc):

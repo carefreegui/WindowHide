@@ -60,6 +60,7 @@ class HideController(QObject):
     state_changed = Signal()          # 隐藏状态变化(UI 刷新用)
     action_done = Signal(str, int)    # (action, count) action: hidden/restored/failed
     hide_incomplete = Signal(int, str)  # (藏不掉的窗口数, 原因提示)
+    privilege_blocked = Signal(str)   # 目标进程权限比我们高(UIPI 拦死)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -155,8 +156,15 @@ class HideController(QObject):
         done = 0
         failed = 0
         failed_names: list[str] = []
+        blocked_names: list[str] = []
         for pid in dict.fromkeys(pids):
             if pid in self._hidden:
+                continue
+            # 权限不够就别动 —— UIPI 会把窗口操作静默吃掉,只留下一个
+            # "最小化了但点不回来"的烂摊子(永劫无间实测事故)。
+            if win32.process_is_higher_integrity(pid):
+                name = win32.process_image_path(pid).rsplit("\\", 1)[-1]
+                blocked_names.append(name or f"pid {pid}")
                 continue
             hp = self._hide_one(pid)
             if hp and hp.window_count > 0:
@@ -169,13 +177,17 @@ class HideController(QObject):
             self._save_state()
             self.state_changed.emit()
             self.action_done.emit("hidden", done)
+        if blocked_names:
+            names = "、".join(dict.fromkeys(blocked_names))
+            self.privilege_blocked.emit(
+                f"{names} 以管理员权限运行,本工具没有权限操作它。"
+                "请用托盘菜单的「以管理员身份重启」后再隐藏。")
         if failed:
             # 静默失败最坑:用户以为藏好了,其实窗口还在屏幕上。
             names = "、".join(dict.fromkeys(failed_names))
             self.hide_incomplete.emit(
-                failed, f"{names} 有 {failed} 个窗口没藏掉,"
-                        "通常是程序以管理员权限运行(需以管理员身份启动本工具),"
-                        "或是它不接受系统的最小化/隐藏指令。")
+                failed, f"{names} 有 {failed} 个窗口没藏掉(已还原到原样),"
+                        "通常是它不接受系统的最小化/隐藏指令。")
         return done
 
     def hide_hwnds(self, hwnds: list[int]) -> int:
@@ -295,7 +307,9 @@ class HideController(QObject):
                 time.sleep(0.2)
         request_tray_icon_restore(hp.pid)
         if main_hwnd and self._settings.activate_on_restore:
-            win32.SetForegroundWindow(main_hwnd)
+            # 全屏游戏光 SetForegroundWindow 常常抢不到前台(前台锁),
+            # 必须走 AttachThreadInput 那条路,否则游戏回来了但停在后台
+            win32.force_foreground(main_hwnd)
 
     def restore_hwnd(self, hwnd: int) -> bool:
         """恢复单个窗口(把它所属的整个进程恢复)。"""

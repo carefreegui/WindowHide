@@ -49,7 +49,9 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_DISPLAY_NAME)
 
-    if _already_running():
+    if _already_running() and "--elevated" not in sys.argv:
+        # --elevated 是"以管理员身份重启"带过来的:此刻旧实例正在退出,
+        # 互斥体还没释放,不能因为看到旧实例就把新进程退掉。
         _wake_existing()
         return 0
 

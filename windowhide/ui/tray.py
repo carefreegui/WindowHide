@@ -1,6 +1,8 @@
 """tray.py - 系统托盘图标与菜单。"""
 from __future__ import annotations
 
+import ctypes
+
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
@@ -19,11 +21,18 @@ class SystemTray(QSystemTrayIcon):
         self.act_toggle = QAction("隐藏目标 / 恢复全部", self.menu)
         self.act_hide_self = QAction("最小化到托盘", self.menu)
         self.act_show = QAction("显示主界面", self.menu)
+        # 目标程序以管理员权限运行时,普通权限的进程碰不了它的窗口(UIPI),
+        # 只能提权重启本工具。已经提权就置灰。
+        self.act_elevate = QAction("以管理员身份重启", self.menu)
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            self.act_elevate.setText("已以管理员身份运行")
+            self.act_elevate.setEnabled(False)
         self.act_quit = QAction("退出", self.menu)
         self.menu.addAction(self.act_toggle)
         self.menu.addAction(self.act_hide_self)
         self.menu.addSeparator()
         self.menu.addAction(self.act_show)
+        self.menu.addAction(self.act_elevate)
         self.menu.addSeparator()
         self.menu.addAction(self.act_quit)
         self.setContextMenu(self.menu)

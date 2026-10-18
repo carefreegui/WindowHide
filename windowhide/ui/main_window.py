@@ -1,6 +1,9 @@
 """main_window.py - 主窗口。"""
 from __future__ import annotations
 
+import ctypes
+import os
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
@@ -110,12 +113,14 @@ class MainWindow(QMainWindow):
         self._controller.state_changed.connect(self.refresh)
         self._controller.action_done.connect(self._on_action)
         self._controller.hide_incomplete.connect(self._on_hide_incomplete)
+        self._controller.privilege_blocked.connect(self._on_privilege_blocked)
         self._hotkeys.triggered.connect(self._on_hotkey)
         self._hotkeys.register_failed.connect(self._on_hotkey_failed)
 
         self._tray.act_toggle.triggered.connect(self._toggle_targets)
         self._tray.act_hide_self.triggered.connect(self._hide_self)
         self._tray.act_show.triggered.connect(self._show_window)
+        self._tray.act_elevate.triggered.connect(self._restart_as_admin)
         self._tray.act_quit.triggered.connect(self._quit)
         self._tray.activated.connect(self._on_tray_activated)
 
@@ -297,12 +302,45 @@ class MainWindow(QMainWindow):
             if self._config.show_balloon:
                 self._tray.showMessage("已恢复", f"{count} 个程序已恢复显示")
 
+    def _restart_as_admin(self) -> None:
+        """以管理员身份重启自己。
+
+        目标程序以管理员权限运行时,普通权限进程对它的窗口操作会被 UIPI
+        静默拦掉(连 SetWindowLongPtr 都不报错),只能整套搬到提权进程里。
+        """
+        import sys
+        from pathlib import Path
+
+        # 入口脚本路径:优先用启动时的 argv[0],取不到就按包位置推 run.pyw
+        script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if not script or not os.path.exists(script):
+            script = str(Path(__file__).resolve().parents[2] / "run.pyw")
+        # --elevated:跳过单实例检查 —— 此刻旧实例还在退出过程中,
+        # 互斥体没释放,不跳过的话新进程会以为"已有一个实例"而直接退出。
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, f'"{script}" --elevated', None, 1)
+        if int(ret) <= 32:
+            self._tray.showMessage("提权失败", "管理员授权被取消,本次未重启")
+            return
+        self._hotkeys.stop()
+        self._tray.hide()
+        # 直接退进程:隐藏状态已落盘,新实例启动时会重新接管,
+        # 走 QApplication.quit() 反而会先 restore_all 把窗口全放出来。
+        os._exit(0)
+
     def _on_hide_incomplete(self, count: int, hint: str) -> None:
         """有窗口没藏掉时必须说出来 —— 静默失败最坑,用户以为藏好了。"""
         self.statusBar().showMessage("警告:" + hint)
         self._tray.showMessage("部分窗口未能隐藏", hint)
         from ..log import write
         write("界面提示: " + hint)
+
+    def _on_privilege_blocked(self, msg: str) -> None:
+        """目标权限比我们高:说清原因,别让用户以为工具坏了。"""
+        self.statusBar().showMessage("警告:" + msg)
+        self._tray.showMessage("需要管理员权限", msg)
+        from ..log import write
+        write("界面提示: " + msg)
 
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:      # 左键点击 = 切换
