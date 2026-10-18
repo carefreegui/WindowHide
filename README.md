@@ -21,7 +21,7 @@
 - **工具自藏**
   - 「隐藏本工具」快捷键/托盘菜单:把主窗口收进托盘(与点叉号等效),双击托盘图标唤回
 - **可选辅助控制**
-  - 隐藏时同时静音目标程序(调用系统音量合成器接口,恢复时自动取消)
+  - 隐藏时同时静音目标程序(调用系统音量合成器接口,含子孙进程,恢复时自动取消)
 - **不打扰**
   - 只改窗口显示状态,不向目标程序发送任何按键/鼠标事件
   - 关闭主界面默认最小化到托盘,不退出
@@ -71,7 +71,7 @@ windowhide/
 │   │   ├── hide.py           #   隐藏/恢复控制器(含持续隐藏看门狗)
 │   │   ├── trayhide.py       #   托盘图标跨进程移除/恢复
 │   │   ├── hotkeys.py        #   全局热键(RegisterHotKey 线程)
-│   │   └── audio.py          #   按进程静音(Core Audio)
+│   │   └── audio.py          #   按进程树静音(Core Audio,含子孙进程)
 │   └── ui/                   # PySide6 界面
 │       ├── main_window.py    #   主窗口
 │       ├── window_list.py    #   窗口表格
@@ -83,6 +83,7 @@ windowhide/
     ├── smoke_test.py         # 冒烟测试(枚举/分类/配置/托盘通路)
     ├── integration_test.py   # 真实窗口隐藏恢复 + 托盘移除恢复 + 热键模拟
     ├── audio_test.py         # 静音功能测试(播音探针 + 静音/取消/状态查询)
+    ├── audio_tree_test.py    # 进程树静音(父进程无会话、子进程播音,模拟浏览器)
     ├── tray_click_test.py    # 托盘点击切换链路(进程内真实 MainWindow)
     ├── checkbox_test.py      # 勾选行为回归(跨刷新保留/双击不误隐藏)
     ├── hang_test.py          # 无响应窗口不阻塞测试(挂起探针)
@@ -119,6 +120,15 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 在 vtable 索引 5(前面有两个方法),`IAudioSessionControl2::GetProcessId`
 在索引 14(前面有 11 个方法)。*
 
+**浏览器静不了音?因为音频不在主进程放** 用户实测:浏览器能隐藏但静不了音,
+游戏却能静。原因:Chromium 系(Edge/Chrome)的声音由 **audio service 子进程**
+播放(实测 Edge 主 pid 零会话,2 个会话全在子进程上),按主窗口 pid 找会话
+当然静不了;游戏是主进程直接放音频,所以旧逻辑对游戏有效。
+*修复:`set_process_mute` / `is_process_muted` 的目标从单个 pid 扩展为
+**pid + 全部子孙进程**(`win32.process_descendants`,toolhelp 快照建父子表
+再 BFS)。用进程树而非进程名匹配,不会误伤同名的其它浏览器实例。
+回归测试 `audio_tree_test.py` 用"父进程无会话、子进程播音"确定性复现。*
+
 **窗口枚举必须防挂起** `GetWindowTextW` / `WM_GETICON` 都是跨线程
 `SendMessage`,遇到"无响应"进程的窗口会**无限期阻塞调用方** —— 曾导致
 点击隐藏后整个工具卡死(栈停在 `get_window_text`)。现在统一改用
@@ -153,6 +163,7 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 python tests/smoke_test.py        # 冒烟:枚举/分类/配置/托盘通路
 python tests/integration_test.py  # 集成:测试窗口隐藏恢复 + 托盘移除恢复 + 热键
 python tests/audio_test.py        # 静音:播音探针静音/取消/状态查询
+python tests/audio_tree_test.py   # 进程树静音:父进程无会话、子进程播音(模拟浏览器)
 python tests/tray_click_test.py   # 托盘点击切换链路(进程内真实界面)
 python tests/checkbox_test.py     # 勾选行为:跨刷新保留 + 双击不误隐藏 + 全选切换
 python tests/hang_test.py         # 无响应窗口不阻塞(挂起探针)
@@ -169,6 +180,7 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 | 冒烟(枚举/分类/配置/托盘通路自检) | 全部通过 |
 | 集成(隐藏/恢复/样式还原/托盘删除与重注册/热键链路) | 12/12 通过 |
 | 静音(静音→取消→状态查询,连跑 3 次稳定) | 全部通过 |
+| 进程树静音(父无会话/子播音,浏览器架构) | 全部通过 |
 | 托盘点击切换(曾因漏导入失效,现有回归测试) | 全部通过 |
 | 勾选行为(跨刷新保留/双击不误隐藏/全选切换/消失清理) | 全部通过 |
 | 无响应窗口不阻塞 | 全部通过 |

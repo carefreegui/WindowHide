@@ -55,6 +55,38 @@ STILL_ACTIVE = 259
 
 ERROR_ACCESS_DENIED = 5
 
+TH32CS_SNAPPROCESS = 0x00000002
+MAX_PATH = 260
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    """toolhelp 进程快照项(64 位布局;本项目只支持 64 位 Windows)。"""
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_ulonglong),   # ULONG_PTR
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("cx", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * MAX_PATH),
+    ]
+
+
+CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+Process32FirstW = kernel32.Process32FirstW
+Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+Process32FirstW.restype = wintypes.BOOL
+
+Process32NextW = kernel32.Process32NextW
+Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+Process32NextW.restype = wintypes.BOOL
+
 # ---------------------------------------------------------------- 函数原型
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -356,6 +388,39 @@ def process_is_alive(pid: int) -> bool:
         return False
     finally:
         CloseHandle(h)
+
+
+def process_descendants(pid: int) -> set[int]:
+    """返回 pid 的所有子孙进程 id(不含自身)。
+
+    用途:Chromium 系浏览器(Edge/Chrome)的音频不在主进程放,而在
+    audio service 子进程放 —— 按主窗口 pid 静音找不到会话,必须把
+    整个进程树都算上。快照失败时返回空集合(调用方按单进程处理)。
+    """
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap in (0, -1) or snap == wintypes.HANDLE(-1).value:
+        return set()
+    children: dict[int, list[int]] = {}
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            children.setdefault(int(entry.th32ParentProcessID), []).append(
+                int(entry.th32ProcessID))
+            ok = Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        CloseHandle(snap)
+
+    out: set[int] = set()
+    queue = list(children.get(pid, ()))
+    while queue:
+        cur = queue.pop()
+        if cur in out or cur == pid:
+            continue
+        out.add(cur)
+        queue.extend(children.get(cur, ()))
+    return out
 
 
 def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:

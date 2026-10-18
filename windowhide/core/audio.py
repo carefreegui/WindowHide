@@ -88,8 +88,12 @@ def _ensure_com_initialized() -> None:
     ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
 
 
-def _iter_session_volumes(target_pid: int):
-    """产出目标进程的所有 ISimpleAudioVolume 接口指针(调用方负责 Release)。"""
+def _iter_session_controls():
+    """产出所有渲染设备上的音频会话控制接口:(pid, ctrl)。
+
+    ctrl 是 IAudioSessionControl,调用方负责 Release。
+    用 Activate(而非 QueryInterface)拿会话管理器 —— 文档推荐路径。
+    """
     _ensure_com_initialized()
     enumerator = _co_create_instance(CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator)
     if not enumerator:
@@ -115,7 +119,6 @@ def _iter_session_volumes(target_pid: int):
                 if hr != 0 or not device.value:
                     continue
 
-                # 用 Activate(而非 QueryInterface)拿会话管理器 —— 文档推荐路径
                 mgr = ctypes.c_void_p()
                 fn = _com_method(device, IDX_ACTIVATE, ctypes.c_long,
                                  ctypes.POINTER(GUID), wintypes.DWORD,
@@ -145,23 +148,23 @@ def _iter_session_volumes(target_pid: int):
                             hr = fn(sessions, j, ctypes.byref(ctrl))
                             if hr != 0 or not ctrl.value:
                                 continue
-                            try:
-                                ctrl2 = _query_interface(ctrl, IID_IAudioSessionControl2)
-                                if not ctrl2:
-                                    continue
-                                try:
-                                    pid = wintypes.DWORD(0)
-                                    fn = _com_method(ctrl2, IDX_GET_PROCESS_ID,
-                                                     ctypes.c_long, ctypes.c_void_p)
-                                    fn(ctrl2, ctypes.byref(pid))
-                                    if int(pid.value) == target_pid:
-                                        vol = _query_interface(ctrl, IID_ISimpleAudioVolume)
-                                        if vol:
-                                            yield vol
-                                finally:
-                                    _release(ctrl2)
-                            finally:
+                            ctrl2 = _query_interface(ctrl, IID_IAudioSessionControl2)
+                            if not ctrl2:
                                 _release(ctrl)
+                                continue
+                            try:
+                                pid = wintypes.DWORD(0)
+                                fn = _com_method(ctrl2, IDX_GET_PROCESS_ID,
+                                                 ctypes.c_long, ctypes.c_void_p)
+                                fn(ctrl2, ctypes.byref(pid))
+                            finally:
+                                _release(ctrl2)
+                            # 注意:ctrl 的所有权随 yield 转移给调用方,
+                            # 由调用方 Release。这里绝不能再 release ——
+                            # 否则调用方拿到的就是已释放指针(COM 双重
+                            # 释放会直接搞垮音频服务)。调用方若中途 break
+                            # 未耗尽迭代,最坏漏一个引用,好过双重释放。
+                            yield int(pid.value), ctrl
                     finally:
                         _release(sessions)
                 finally:
@@ -172,38 +175,169 @@ def _iter_session_volumes(target_pid: int):
         _release(enumerator)
 
 
+def _iter_session_volumes(target_pid: int):
+    """产出目标进程的所有 ISimpleAudioVolume 接口指针(调用方负责 Release)。"""
+    for pid, ctrl in _iter_session_controls():
+        try:
+            if pid != target_pid:
+                continue
+            vol = _query_interface(ctrl, IID_ISimpleAudioVolume)
+            if vol:
+                yield vol
+        finally:
+            _release(ctrl)
+
+
+def session_pids() -> dict[int, int]:
+    """诊断用:当前所有渲染设备上的音频会话,返回 {pid: 会话数}。"""
+    counts: dict[int, int] = {}
+    try:
+        for pid, ctrl in _iter_session_controls():
+            try:
+                if pid:
+                    counts[pid] = counts.get(pid, 0) + 1
+            finally:
+                _release(ctrl)
+    except Exception:
+        pass
+    return counts
+
+
+def _pids_with_descendants(pid: int) -> list[int]:
+    """目标 pid + 其所有子孙进程。
+
+    Chromium 系浏览器(Edge/Chrome)的音频在 audio service 子进程里放,
+    只按主窗口 pid 找会话什么都静不了(用户实测:浏览器静不了、游戏能静,
+    因为游戏是主进程直接放音频)。快照失败时退化为单进程。
+    """
+    from . import win32
+    pids = [pid]
+    try:
+        pids.extend(sorted(win32.process_descendants(pid)))
+    except Exception:
+        pass
+    return pids
+
+
+def session_pids() -> dict[int, int]:
+    """诊断用:当前所有渲染设备上的音频会话,返回 {pid: 会话数}。"""
+    counts: dict[int, int] = {}
+    try:
+        # 复用 _iter_session_volumes 的枚举链路:对每个已枚举到的会话
+        # 记录 pid(不过滤目标进程)
+        _ensure_com_initialized()
+        enumerator = _co_create_instance(CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator)
+        if not enumerator:
+            return counts
+        try:
+            collection = ctypes.c_void_p()
+            fn = _com_method(enumerator, IDX_ENUM_AUDIO_ENDPOINTS, ctypes.c_long,
+                             ctypes.c_int, wintypes.DWORD, ctypes.c_void_p)
+            hr = fn(enumerator, EDATA_FLOW_RENDER, DEVICE_STATE_ACTIVE, ctypes.byref(collection))
+            if hr != 0 or not collection.value:
+                return counts
+            try:
+                count = wintypes.UINT(0)
+                fn = _com_method(collection, IDX_GET_COUNT, ctypes.c_long, ctypes.c_void_p)
+                fn(collection, ctypes.byref(count))
+                for i in range(count.value):
+                    device = ctypes.c_void_p()
+                    fn = _com_method(collection, IDX_ITEM, ctypes.c_long, ctypes.c_uint, ctypes.c_void_p)
+                    hr = fn(collection, i, ctypes.byref(device))
+                    if hr != 0 or not device.value:
+                        continue
+                    mgr = ctypes.c_void_p()
+                    fn = _com_method(device, IDX_ACTIVATE, ctypes.c_long,
+                                     ctypes.POINTER(GUID), wintypes.DWORD,
+                                     ctypes.c_void_p, ctypes.c_void_p)
+                    hr = fn(device, ctypes.byref(IID_IAudioSessionManager2),
+                            CLSCTX_ALL, None, ctypes.byref(mgr))
+                    _release(device)
+                    if hr != 0 or not mgr.value:
+                        continue
+                    try:
+                        sessions = ctypes.c_void_p()
+                        fn = _com_method(mgr, IDX_GET_SESSION_ENUMERATOR, ctypes.c_long, ctypes.c_void_p)
+                        hr = fn(mgr, ctypes.byref(sessions))
+                        if hr != 0 or not sessions.value:
+                            continue
+                        try:
+                            scount = wintypes.UINT(0)
+                            fn = _com_method(sessions, IDX_GET_COUNT, ctypes.c_long, ctypes.c_void_p)
+                            fn(sessions, ctypes.byref(scount))
+                            for j in range(scount.value):
+                                ctrl = ctypes.c_void_p()
+                                fn = _com_method(sessions, IDX_GET_SESSION, ctypes.c_long,
+                                                 ctypes.c_int, ctypes.c_void_p)
+                                hr = fn(sessions, j, ctypes.byref(ctrl))
+                                if hr != 0 or not ctrl.value:
+                                    continue
+                                try:
+                                    ctrl2 = _query_interface(ctrl, IID_IAudioSessionControl2)
+                                    if not ctrl2:
+                                        continue
+                                    try:
+                                        pid = wintypes.DWORD(0)
+                                        fn = _com_method(ctrl2, IDX_GET_PROCESS_ID,
+                                                         ctypes.c_long, ctypes.c_void_p)
+                                        fn(ctrl2, ctypes.byref(pid))
+                                        p = int(pid.value)
+                                        if p:
+                                            counts[p] = counts.get(p, 0) + 1
+                                    finally:
+                                        _release(ctrl2)
+                                finally:
+                                    _release(ctrl)
+                        finally:
+                            _release(sessions)
+                    finally:
+                        _release(mgr)
+            finally:
+                _release(collection)
+        finally:
+            _release(enumerator)
+    except Exception:
+        pass
+    return counts
+
+
 def set_process_mute(pid: int, mute: bool) -> int:
-    """静音/取消静音目标进程。返回被操作的音频会话数量。"""
+    """静音/取消静音目标进程(含子孙进程)。返回被操作的音频会话数量。"""
     n = 0
     try:
-        for vol in _iter_session_volumes(pid):
-            try:
-                fn = _com_method(vol, IDX_SET_MUTE, ctypes.c_long,
-                                 wintypes.BOOL, ctypes.c_void_p)
-                fn(vol, bool(mute), None)
-                n += 1
-            finally:
-                _release(vol)
+        for p in _pids_with_descendants(pid):
+            for vol in _iter_session_volumes(p):
+                try:
+                    fn = _com_method(vol, IDX_SET_MUTE, ctypes.c_long,
+                                     wintypes.BOOL, ctypes.c_void_p)
+                    fn(vol, bool(mute), None)
+                    n += 1
+                finally:
+                    _release(vol)
     except Exception:
         pass
     return n
 
 
 def is_process_muted(pid: int) -> bool | None:
-    """查询目标进程是否所有音频会话都处于静音状态。"""
+    """查询目标进程(含子孙进程)是否所有音频会话都处于静音状态。
+
+    0 个会话返回 None;任一会话未静音返回 False。
+    """
     try:
         total = 0
         muted = 0
-        for vol in _iter_session_volumes(pid):
-            try:
-                fn = _com_method(vol, IDX_GET_MUTE, ctypes.c_long, ctypes.c_void_p)
-                flag = wintypes.BOOL(0)
-                fn(vol, ctypes.byref(flag))
-                total += 1
-                if flag.value:
-                    muted += 1
-            finally:
-                _release(vol)
+        for p in _pids_with_descendants(pid):
+            for vol in _iter_session_volumes(p):
+                try:
+                    fn = _com_method(vol, IDX_GET_MUTE, ctypes.c_long, ctypes.c_void_p)
+                    flag = wintypes.BOOL(0)
+                    fn(vol, ctypes.byref(flag))
+                    total += 1
+                    if flag.value:
+                        muted += 1
+                finally:
+                    _release(vol)
         if total == 0:
             return None
         return muted == total
