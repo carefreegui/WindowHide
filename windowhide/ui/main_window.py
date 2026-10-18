@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
 
         self._controller.state_changed.connect(self.refresh)
         self._controller.action_done.connect(self._on_action)
+        self._controller.hide_incomplete.connect(self._on_hide_incomplete)
         self._hotkeys.triggered.connect(self._on_hotkey)
         self._hotkeys.register_failed.connect(self._on_hotkey_failed)
 
@@ -130,7 +131,13 @@ class MainWindow(QMainWindow):
         self._windows = [w for w in windows
                          if w.pid != our_pid
                          and (w.visible or w.hwnd in hidden)
-                         and w.title]
+                         # 桌面/任务栏(explorer 的 Progman/Shell_TrayWnd)
+                         # 一律不列 —— 它们混进来就等于给了用户一个
+                         # "一键把桌面藏了"的按钮
+                         and not win32.is_shell_window(w.hwnd)
+                         # 无标题但铺满屏幕的(全屏游戏常见)也要列出来,
+                         # 否则用户根本没地方勾选它
+                         and (w.title or win32.is_fullscreen_window(w.hwnd))]
         for w in self._windows:
             w.process_name = w.process_name or win32.process_image_path(w.pid).rsplit("\\", 1)[-1]
             if not w.process_path:
@@ -289,6 +296,13 @@ class MainWindow(QMainWindow):
             write(f"恢复 {count} 个程序")
             if self._config.show_balloon:
                 self._tray.showMessage("已恢复", f"{count} 个程序已恢复显示")
+
+    def _on_hide_incomplete(self, count: int, hint: str) -> None:
+        """有窗口没藏掉时必须说出来 —— 静默失败最坑,用户以为藏好了。"""
+        self.statusBar().showMessage("警告:" + hint)
+        self._tray.showMessage("部分窗口未能隐藏", hint)
+        from ..log import write
+        write("界面提示: " + hint)
 
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:      # 左键点击 = 切换

@@ -2,6 +2,8 @@
 
 隐藏 = 窗口从任务栏和 Alt+Tab 消失(SW_HIDE + WS_EX_TOOLWINDOW),
       程序继续在后台运行;同时尽力移除其托盘图标。
+      全屏窗口(游戏)走另一条路:先最小化让它掉出独占全屏,再 SW_HIDE
+      —— 详见 win32.hide_plan。
 恢复 = 还原样式与显示状态,取消静音,广播 TaskbarCreated 让托盘图标回来。
 
 隐藏状态会持久化到 %APPDATA%/WindowHide/hidden_state.json:
@@ -36,6 +38,7 @@ class WindowRecord:
     ex_style: int
     show_cmd: int
     title: str = ""
+    fullscreen: bool = False   # 隐藏时是否全屏(走的是"先最小化再隐藏")
 
 
 @dataclass(slots=True)
@@ -56,12 +59,14 @@ class HideController(QObject):
 
     state_changed = Signal()          # 隐藏状态变化(UI 刷新用)
     action_done = Signal(str, int)    # (action, count) action: hidden/restored/failed
+    hide_incomplete = Signal(int, str)  # (藏不掉的窗口数, 原因提示)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self._settings = settings          # Config 对象(读 mute/keep_hidden 等)
         self._hidden: dict[int, HiddenProcess] = {}
         self._last_fg_pid = 0              # 最近一次「隐藏前台窗口」藏掉的进程
+        self._retry: dict[int, int] = {}   # hwnd -> 已重试次数(藏不掉的窗口别无限刷)
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._watch)
@@ -73,7 +78,8 @@ class HideController(QObject):
         data = {"version": 1, "hidden": [
             {"pid": hp.pid, "process_name": hp.process_name, "muted": hp.muted,
              "records": [{"hwnd": r.hwnd, "ex_style": r.ex_style,
-                          "show_cmd": r.show_cmd, "title": r.title}
+                          "show_cmd": r.show_cmd, "title": r.title,
+                          "fullscreen": r.fullscreen}
                          for r in hp.records.values()]}
             for hp in self._hidden.values()
         ]}
@@ -109,13 +115,14 @@ class HideController(QObject):
                     continue
                 if win32.get_window_pid(hwnd) != pid:
                     continue          # 句柄已被回收给别的窗口
-                if win32.IsWindowVisible(hwnd):
+                if win32.IsWindowVisible(hwnd) and not win32.IsIconic(hwnd):
                     continue          # 已经重新显示了,不是我们隐藏的状态
                 if not (win32.get_window_styles(hwnd)[1] & win32.WS_EX_TOOLWINDOW):
                     continue          # 没有我们加的工具窗样式
                 hp.records[hwnd] = WindowRecord(
                     hwnd, int(rec.get("ex_style", 0)),
-                    int(rec.get("show_cmd", 9)), str(rec.get("title", "")))
+                    int(rec.get("show_cmd", 9)), str(rec.get("title", "")),
+                    bool(rec.get("fullscreen", False)))
             if hp.records:
                 self._hidden[pid] = hp
                 loaded += 1
@@ -146,6 +153,8 @@ class HideController(QObject):
     def hide_pids(self, pids: list[int]) -> int:
         """隐藏指定进程的所有可见顶层窗口。返回成功隐藏的进程数。"""
         done = 0
+        failed = 0
+        failed_names: list[str] = []
         for pid in dict.fromkeys(pids):
             if pid in self._hidden:
                 continue
@@ -153,10 +162,20 @@ class HideController(QObject):
             if hp and hp.window_count > 0:
                 self._hidden[pid] = hp
                 done += 1
+                if hp.failed:
+                    failed += hp.failed
+                    failed_names.append(hp.process_name or f"pid {pid}")
         if done:
             self._save_state()
             self.state_changed.emit()
             self.action_done.emit("hidden", done)
+        if failed:
+            # 静默失败最坑:用户以为藏好了,其实窗口还在屏幕上。
+            names = "、".join(dict.fromkeys(failed_names))
+            self.hide_incomplete.emit(
+                failed, f"{names} 有 {failed} 个窗口没藏掉,"
+                        "通常是程序以管理员权限运行(需以管理员身份启动本工具),"
+                        "或是它不接受系统的最小化/隐藏指令。")
         return done
 
     def hide_hwnds(self, hwnds: list[int]) -> int:
@@ -181,8 +200,7 @@ class HideController(QObject):
         """
         hwnd = win32.GetForegroundWindow()
         if hwnd:
-            if win32.get_class_name(hwnd) in ("Progman", "WorkerW",
-                                              "Shell_TrayWnd"):
+            if win32.is_shell_window(hwnd):
                 return 0
             pid = win32.get_window_pid(hwnd)
             if pid == os.getpid():
@@ -210,14 +228,25 @@ class HideController(QObject):
             if not w.visible and not w.minimized:
                 continue  # 本来就隐藏的窗口不动,恢复时也不会把它弹出来
             name = name or w.process_name
+            fullscreen = win32.is_fullscreen_window(w.hwnd)
             ex_style, show_cmd = win32.hide_window(w.hwnd)
-            records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title)
-            if win32.IsWindowVisible(w.hwnd):
-                failed += 1  # 隐藏后仍然可见 = 失败(通常是权限不足)
+            records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title,
+                                           fullscreen)
+            # 判据是"真的不在屏幕上了"(隐藏或最小化),不是 IsWindowVisible ——
+            # 全屏游戏被最小化时 IsWindowVisible 依然是 True。
+            if not win32.is_offscreen(w.hwnd):
+                failed += 1
         if not records:
             return None
+        if not name:
+            # 调用方(如测试/命令行)不一定填过 process_name,报警文案要能
+            # 指名道姓,不然用户只看到一个 pid
+            name = win32.process_image_path(pid).rsplit("\\", 1)[-1]
 
         hp = HiddenProcess(pid=pid, process_name=name, records=records, failed=failed)
+        if failed:
+            from ..log import write
+            write(f"未能隐藏的窗口:{name}(pid={pid}) 失败 {failed}/{len(records)} 个")
         # 托盘图标
         delete_process_tray_icons(pid)
         # 静音
@@ -248,6 +277,7 @@ class HideController(QObject):
         main_hwnd = 0
         main_size = -1
         for hwnd, rec in hp.records.items():
+            self._retry.pop(hwnd, None)
             if not win32.IsWindow(hwnd):
                 continue
             win32.restore_window(hwnd, rec.ex_style, rec.show_cmd)
@@ -302,16 +332,28 @@ class HideController(QObject):
             if not self._settings.keep_hidden:
                 continue
             for w in win32.enum_process_windows(pid):
-                if not w.visible and not w.minimized:
+                # 只在窗口"又回到了屏幕上"时补刀。最小化/隐藏中的窗口是
+                # 我们想要的状态,别每秒重刷一遍(全屏游戏会因此反复被
+                # 最小化,画面闪)。
+                if not w.visible or w.minimized:
                     continue
+                tries = self._retry.get(w.hwnd, 0)
+                if tries >= 3:
+                    continue  # 藏不掉的窗口(如管理员权限)别无限重试
+                fullscreen = win32.is_fullscreen_window(w.hwnd)
+                ex_style, show_cmd = win32.hide_window(w.hwnd)
+                if win32.is_offscreen(w.hwnd):
+                    self._retry.pop(w.hwnd, None)
+                else:
+                    self._retry[w.hwnd] = tries + 1
                 if w.hwnd in hp.records:
                     # 应用自己又把窗口显示出来了,重新隐藏
-                    ex_style, show_cmd = win32.hide_window(w.hwnd)
                     hp.records[w.hwnd].ex_style = ex_style
                     hp.records[w.hwnd].show_cmd = show_cmd
+                    hp.records[w.hwnd].fullscreen = fullscreen
                 else:
-                    ex_style, show_cmd = win32.hide_window(w.hwnd)
-                    hp.records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title)
+                    hp.records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd,
+                                                      w.title, fullscreen)
                 dirty = True
         if dirty:
             self._save_state()

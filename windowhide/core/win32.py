@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ctypes
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -21,7 +22,12 @@ GCLP_HICON = -14
 GCLP_HICONSM = -34
 
 WS_VISIBLE = 0x10000000
+WS_CAPTION = 0x00C00000
+WS_DISABLED = 0x02000000
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_NOREDIRECTIONBITMAP = 0x00200000
 WS_EX_APPWINDOW = 0x00040000
 WS_EX_TOPMOST = 0x00000008
 
@@ -37,7 +43,20 @@ SW_SHOWNA = 8
 SW_RESTORE = 9
 SW_MAX = 11
 
+# SetWindowPos 标志
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+SWP_HIDEWINDOW = 0x0080
+SWP_STATECHANGED = 0x8000
+
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
 WM_GETICON = 0x007F
+WM_SYSCOMMAND = 0x0112
+SC_MINIMIZE = 0xF020
 WM_HOTKEY = 0x0312
 WM_COPYDATA = 0x004A
 WM_QUIT = 0x0012
@@ -137,6 +156,26 @@ SetWindowLongPtrW.restype = ctypes.c_ssize_t
 ShowWindow = user32.ShowWindow
 ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 ShowWindow.restype = wintypes.BOOL
+
+# 异步版:把显示状态变更投递给目标线程后立刻返回。
+# 同步 ShowWindow 跨进程要等目标线程处理完 WM_WINDOWPOSCHANGED,
+# 全屏游戏主循环一卡,本工具的 UI 就跟着卡住。
+ShowWindowAsync = user32.ShowWindowAsync
+ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+ShowWindowAsync.restype = wintypes.BOOL
+
+SetWindowPos = user32.SetWindowPos
+SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                         ctypes.c_int, ctypes.c_int, wintypes.UINT]
+SetWindowPos.restype = wintypes.BOOL
+
+MonitorFromWindow = user32.MonitorFromWindow
+MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+MonitorFromWindow.restype = wintypes.HANDLE
+
+GetMonitorInfoW = user32.GetMonitorInfoW
+GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+GetMonitorInfoW.restype = wintypes.BOOL
 
 SetForegroundWindow = user32.SetForegroundWindow
 SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -271,6 +310,15 @@ GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 GetWindowRect.restype = wintypes.BOOL
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
 class WINDOWPLACEMENT(ctypes.Structure):
     _fields_ = [
         ("length", wintypes.UINT),
@@ -340,6 +388,17 @@ def get_window_pid(hwnd: int) -> int:
     pid = wintypes.DWORD(0)
     GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return int(pid.value)
+
+
+# 桌面/任务栏的窗口类名。这些属于 explorer,按进程隐藏会连桌面一起藏掉
+# (用户实测踩过一次"点一下连桌面都没了")。列表不显示、隐藏也拦一道。
+SHELL_WINDOW_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd",
+                        "Shell_SecondaryTrayWnd")
+
+
+def is_shell_window(hwnd: int) -> bool:
+    """是不是桌面/任务栏这类外壳窗口。"""
+    return get_class_name(hwnd) in SHELL_WINDOW_CLASSES
 
 
 def get_window_styles(hwnd: int) -> tuple[int, int]:
@@ -517,7 +576,7 @@ def enum_process_windows_all(pid: int) -> list[WindowInfo]:
     return [w for w in result if w.pid == pid]
 
 
-# ---------------------------------------------------------------- 显示状态操作
+# ---------------------------------------------------------------- 全屏判定
 def set_ex_style(hwnd: int, add: int = 0, remove: int = 0) -> int:
     """安全地增删窗口扩展样式,返回修改后的样式。"""
     old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
@@ -527,15 +586,117 @@ def set_ex_style(hwnd: int, add: int = 0, remove: int = 0) -> int:
     return new
 
 
+def monitor_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """窗口所在显示器的物理矩形;失败返回全 0。"""
+    hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not hmon:
+        return (0, 0, 0, 0)
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    if GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        r = mi.rcMonitor
+        return (r.left, r.top, r.right, r.bottom)
+    return (0, 0, 0, 0)
+
+
+def is_fullscreen_window(hwnd: int) -> bool:
+    """窗口是否处于全屏(无边框且铺满整块显示器)。
+
+    判定标准:没有标题栏 + 覆盖所在显示器 95% 以上 + 是个正常可激活的
+    应用窗口。三条都要满足。
+
+    排除项全是实测踩出来的坑 —— 系统里有不少"铺满屏幕但不是游戏"的窗口:
+    - 带 WS_CAPTION 的最大化浏览器/编辑器;
+    - `Windows 输入体验`(WS_EX_NOREDIRECTIONBITMAP)、`NVIDIA GeForce
+      Overlay`(WS_EX_NOACTIVATE|LAYERED)这类覆盖层:全是不可激活的假窗口;
+    - 桌面 `Program Manager`(Progman):WS_DISABLED + 铺满整个虚拟桌面。
+    把它们误判成全屏的代价是隐藏时白等一次最小化,还可能把覆盖层弄乱。
+    """
+    style, ex_style = get_window_styles(hwnd)
+    if style & (WS_CAPTION | WS_DISABLED):
+        return False
+    if ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED
+                   | WS_EX_NOREDIRECTIONBITMAP):
+        return False
+    l, t, r, b = get_window_rect(hwnd)
+    ml, mt, mr, mb = monitor_rect(hwnd)
+    mw, mh = mr - ml, mb - mt
+    if mw <= 0 or mh <= 0:
+        return False
+    return (r - l) >= mw * 0.95 and (b - t) >= mh * 0.95
+
+
+def is_offscreen(hwnd: int) -> bool:
+    """窗口是否已经不在屏幕上了(隐藏,或已最小化)。
+
+    最小化也算 —— 最小化的窗口 IsWindowVisible 仍是 True,但用户看不见它。
+    旧的失败判据只用 IsWindowVisible,会把"全屏游戏被最小化"误报成失败。
+    """
+    if not IsWindowVisible(hwnd):
+        return True
+    return bool(IsIconic(hwnd))
+
+
+def hide_plan(hwnd: int) -> str:
+    """隐藏策略。全屏窗口必须"先最小化、再隐藏",其它窗口直接隐藏。
+
+    为什么全屏要绕这一下:独占全屏的游戏由 D3D/DXGI 直接把画面翻转输出
+    到显示器,根本不看窗口的 WS_VISIBLE —— 把窗口 SW_HIDE 掉,画面还在,
+    用户看到的就是"声音停了但游戏还在屏幕上"(实测踩坑)。
+    最小化是让游戏掉出独占全屏最可靠的手段(等价于点最小化/Alt+Tab),
+    退出独占后再 SW_HIDE 才真的消失。
+    """
+    return "minimize_then_hide" if is_fullscreen_window(hwnd) else "hide"
+
+
+def _wait_offscreen(hwnd: int, timeout: float) -> bool:
+    """轮询等待窗口离开屏幕,最多 timeout 秒。返回是否已离开。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        if is_offscreen(hwnd):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def minimize_window(hwnd: int) -> None:
+    """让窗口最小化(两条路一起走,谁先生效算谁的)。
+
+    - PostMessage(WM_SYSCOMMAND, SC_MINIMIZE):和点最小化按钮同一条路径,
+      游戏普遍会在这里暂停渲染并交出全屏。异步发送,不阻塞调用方。
+    - ShowWindowAsync(SW_MINIMIZE):目标线程消息循环忙时的兜底。
+    """
+    PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
+    ShowWindowAsync(hwnd, SW_MINIMIZE)
+
+
 def hide_window(hwnd: int) -> tuple[int, int]:
-    """隐藏窗口:先加 WS_EX_TOOLWINDOW(移出任务栏/Alt+Tab),再 SW_HIDE。
+    """隐藏窗口:先加 WS_EX_TOOLWINDOW(移出任务栏/Alt+Tab),再隐藏。
 
     返回 (原扩展样式, 原显示命令),供恢复用。
     """
     ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
     show_cmd = get_window_placement_cmd(hwnd)
+    # 必须先判定策略再加样式:is_fullscreen_window 会把 WS_EX_TOOLWINDOW
+    # 当作"辅助窗口"排除,先加样式的话自己就把判断废掉了。
+    plan = hide_plan(hwnd)
     set_ex_style(hwnd, add=WS_EX_TOOLWINDOW)
+
+    if plan == "minimize_then_hide":
+        minimize_window(hwnd)
+        _wait_offscreen(hwnd, 0.8)      # 等它真的掉出独占全屏
+        ShowWindowAsync(hwnd, SW_HIDE)  # 退出全屏后隐藏才有效
+        _wait_offscreen(hwnd, 0.3)
+        return ex_style, show_cmd
+
     ShowWindow(hwnd, SW_HIDE)
+    if not is_offscreen(hwnd):
+        # 兜底:同步调用可能被目标线程挡住,换异步 + SetWindowPos 再试
+        ShowWindowAsync(hwnd, SW_HIDE)
+        SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOACTIVATE | SWP_HIDEWINDOW)
     return ex_style, show_cmd
 
 
