@@ -115,6 +115,28 @@ def main() -> int:
     time.sleep(0.3)
     check("再次双击后窗口恢复可见", bool(win32.IsWindowVisible(target.hwnd)))
 
+    # 全选按钮切换行为(曾经的 bug:clicked 的 bool 参数恒为 False,
+    # 点"全选"实际执行 set_all_checked(False) = 全部取消)
+    print("[5.5] 全选切换 / 反选 ...")
+    n_enabled = sum(
+        1 for r in range(table.rowCount())
+        if table.item(r, COL_CHECK)
+        and (table.item(r, COL_CHECK).flags() & Qt.ItemIsEnabled))
+    table.toggle_all_checked()
+    check(f"第一次点全选=全部选中({n_enabled} 个可用行)",
+          n_enabled > 0 and len(table.checked_hwnds()) == n_enabled)
+    table.toggle_all_checked()
+    check("第二次点全选=全部取消", table.checked_hwnds() == [])
+    # 反选保留:只勾一个 -> 反选后它被取消、其余被选上
+    table.item(table._hwnds.index(target.hwnd), COL_CHECK).setCheckState(Qt.Checked)
+    table.invert_checked()
+    check("反选后 dummy 被取消(其余被选上)",
+          target.hwnd not in table.checked_hwnds()
+          and len(table.checked_hwnds()) == n_enabled - 1)
+    table.toggle_all_checked()   # 清空,避免影响后续
+    table.toggle_all_checked()
+    check("收尾:全不选", table.checked_hwnds() == [])
+
     # 窗口消失后勾选被清理
     print("[6] 窗口消失后勾选清理 ...")
     table.item(table._hwnds.index(target.hwnd), COL_CHECK).setCheckState(Qt.Checked)

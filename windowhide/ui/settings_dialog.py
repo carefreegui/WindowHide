@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QPushButton, QRadioButton,
+    QLabel, QListWidget, QListWidgetItem, QPushButton,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -45,26 +45,15 @@ class SettingsDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        mode_box = QGroupBox("模式")
-        mv = QVBoxLayout(mode_box)
-        self._mode_toggle = QRadioButton("单一快捷键:反复切换隐藏 / 恢复")
-        self._mode_split = QRadioButton("分离快捷键:分别设置隐藏与恢复")
-        if self._config.hotkey_mode == "split":
-            self._mode_split.setChecked(True)
-        else:
-            self._mode_toggle.setChecked(True)
-        mv.addWidget(self._mode_toggle)
-        mv.addWidget(self._mode_split)
-        v.addWidget(mode_box)
-
         form = QFormLayout()
         self._cap_toggle = HotkeyCaptureButton(self._config.hotkey_toggle)
-        self._cap_hide = HotkeyCaptureButton(self._config.hotkey_hide)
-        self._cap_restore = HotkeyCaptureButton(self._config.hotkey_restore)
         form.addRow("切换键:", self._cap_toggle)
-        form.addRow("隐藏键:", self._cap_hide)
-        form.addRow("恢复键:", self._cap_restore)
+        tip_mode = QLabel("反复按切换键:有隐藏中的目标则恢复,否则隐藏。"
+                          "隐藏/恢复也可用主界面按钮与托盘菜单。")
+        tip_mode.setWordWrap(True)
+        tip_mode.setStyleSheet("color: #64748b;")
         v.addLayout(form)
+        v.addWidget(tip_mode)
 
         extra = QGroupBox("附加")
         ev = QVBoxLayout(extra)
@@ -157,10 +146,7 @@ class SettingsDialog(QDialog):
 
     # ---------------------------------------------------------------- 导出
     def apply_to(self, config: Config) -> None:
-        config.hotkey_mode = "split" if self._mode_split.isChecked() else "toggle"
         config.hotkey_toggle = self._cap_toggle.spec()
-        config.hotkey_hide = self._cap_hide.spec()
-        config.hotkey_restore = self._cap_restore.spec()
         config.hotkey_foreground = self._cap_fg.spec()
         config.mute_on_hide = self._cb_mute.isChecked()
         config.keep_hidden = self._cb_keep.isChecked()

@@ -48,10 +48,7 @@ def app_dir() -> Path:
 @dataclass(slots=True)
 class Config:
     # 快捷键
-    hotkey_mode: str = "toggle"                       # toggle | split
     hotkey_toggle: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x48))  # Ctrl+Alt+H
-    hotkey_hide: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x48))    # Ctrl+Alt+H
-    hotkey_restore: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x53)) # Ctrl+Alt+S
     hotkey_foreground: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x51))  # Ctrl+Alt+Q
 
     # 行为
@@ -69,10 +66,7 @@ class Config:
     def to_dict(self) -> dict:
         return {
             "version": 1,
-            "hotkey_mode": self.hotkey_mode,
             "hotkey_toggle": self.hotkey_toggle.to_dict(),
-            "hotkey_hide": self.hotkey_hide.to_dict(),
-            "hotkey_restore": self.hotkey_restore.to_dict(),
             "hotkey_foreground": self.hotkey_foreground.to_dict(),
             "mute_on_hide": self.mute_on_hide,
             "keep_hidden": self.keep_hidden,
@@ -86,8 +80,9 @@ class Config:
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
         c = cls()
-        c.hotkey_mode = d.get("hotkey_mode", "toggle")
-        for key in ("hotkey_toggle", "hotkey_hide", "hotkey_restore", "hotkey_foreground"):
+        # 旧版本的 hotkey_mode/hotkey_hide/hotkey_restore 字段已废弃
+        # (隐藏键/恢复键模式下填了也不生效,已按用户反馈删除),直接忽略。
+        for key in ("hotkey_toggle", "hotkey_foreground"):
             if key in d and isinstance(d[key], dict):
                 setattr(c, key, HotkeySpec.from_dict(d[key]))
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",

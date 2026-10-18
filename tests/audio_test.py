@@ -23,6 +23,35 @@ PROBE = ROOT / "tests" / "audio_probe.py"
 PYTHON = sys.executable
 
 
+def wait_session(pid: int, timeout: float = 10.0):
+    """等探针的音频会话出现。
+
+    会话是异步创建的:探针先写 pid 再播音,紧接着查会拿到 None
+    (找不到会话),不能当作故障。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = is_process_muted(pid)
+        if st is not None:
+            return st
+        time.sleep(0.3)
+    return None
+
+
+def set_mute_retry(pid: int, mute: bool, tries: int = 10) -> int:
+    """带重试地静音/取消静音。
+
+    Windows 会临时回收空闲会话再重建(播音循环重启时尤其明显),
+    瞬间查会话数会是 0 —— 重试几次给它时间,别一竿子打成故障。
+    """
+    for _ in range(tries):
+        n = set_process_mute(pid, mute)
+        if n > 0:
+            return n
+        time.sleep(0.3)
+    return 0
+
+
 def main() -> int:
     if STATE.exists():
         STATE.unlink()
@@ -61,14 +90,20 @@ def main() -> int:
         ok = ok and cond
 
     try:
-        st0 = is_process_muted(pid)
-        check("初始状态可查询(False)", st0 is False)
+        st0 = wait_session(pid)
+        check("探针音频会话出现", st0 is not None)
 
-        n = set_process_mute(pid, True)
+        # Windows 音量合成器按"应用"记住静音状态:上一次测试若取消静音
+        # 失败,会给 python.exe 留下静音,新探针生来就是静音的 ——
+        # 先复位,保证从"未静音"开始,测试才可重复。
+        n0 = set_mute_retry(pid, False)
+        check("复位为未静音", n0 > 0 and is_process_muted(pid) is False)
+
+        n = set_mute_retry(pid, True)
         check("静音影响 1 个会话", n == 1)
         check("静音后状态为 True", is_process_muted(pid) is True)
 
-        n = set_process_mute(pid, False)
+        n = set_mute_retry(pid, False)
         check("取消静音影响 1 个会话", n == 1)
         check("取消后状态为 False", is_process_muted(pid) is False)
     finally:

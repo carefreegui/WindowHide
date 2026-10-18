@@ -191,6 +191,22 @@ class WindowTable(QTableWidget):
                     self._checked.discard(hwnd)
                 item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
 
+    def toggle_all_checked(self) -> None:
+        """全选按钮:已全勾则取消全选,否则全选。
+
+        曾经的 bug:按钮直接连 set_all_checked,而 QPushButton.clicked
+        带的 bool 参数对不可勾选按钮恒为 False —— 点"全选"实际执行的是
+        "全部取消",用户表现为"点全选没反应、点反选反而全选"。
+        """
+        enabled = [r for r in range(self.rowCount())
+                   if self.item(r, COL_CHECK)
+                   and (self.item(r, COL_CHECK).flags() & Qt.ItemIsEnabled)]
+        if not enabled:
+            return
+        all_checked = all(self.item(r, COL_CHECK).checkState() == Qt.Checked
+                          for r in enabled)
+        self.set_all_checked(not all_checked)
+
     def invert_checked(self) -> None:
         for row in range(self.rowCount()):
             item = self.item(row, COL_CHECK)

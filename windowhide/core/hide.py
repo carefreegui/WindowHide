@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,6 +61,7 @@ class HideController(QObject):
         super().__init__(parent)
         self._settings = settings          # Config 对象(读 mute/keep_hidden 等)
         self._hidden: dict[int, HiddenProcess] = {}
+        self._last_fg_pid = 0              # 最近一次「隐藏前台窗口」藏掉的进程
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._watch)
@@ -166,10 +168,31 @@ class HideController(QObject):
         return self.hide_pids(pids)
 
     def hide_foreground(self) -> int:
+        """隐藏当前前台窗口所属的进程。
+
+        防自藏:在主界面点「隐藏前台窗口」按钮的瞬间,前台窗口就是
+        本工具自己 —— 不拦这一下的话,工具会把自个儿藏掉,界面直接
+        消失,用户完全不知道去哪恢复(用户实测踩坑)。
+        """
         hwnd = win32.GetForegroundWindow()
         if hwnd:
-            return self.hide_hwnds([hwnd])
+            pid = win32.get_window_pid(hwnd)
+            if pid == os.getpid():
+                return 0
+            n = self.hide_hwnds([hwnd])
+            if n:
+                self._last_fg_pid = pid
+            return n
         return 0
+
+    def restore_last_foreground(self) -> bool:
+        """恢复最近一次「隐藏前台窗口」藏掉的进程。没有则返回 False。"""
+        pid = self._last_fg_pid
+        if pid and pid in self._hidden:
+            self._last_fg_pid = 0
+            self.restore_pids([pid])
+            return True
+        return False
 
     def _hide_one(self, pid: int) -> HiddenProcess | None:
         name = ""
@@ -225,7 +248,13 @@ class HideController(QObject):
             if area > main_size:
                 main_size, main_hwnd = area, hwnd
         if hp.muted:
-            set_process_mute(hp.pid, False)
+            # 音频会话可能被系统临时回收后再重建(播音循环重启时尤其明显),
+            # 瞬间取消静音会影响 0 个会话 —— 重试几次,否则用户恢复窗口后
+            # 应用一直处于静音状态(实测踩坑)。
+            for _ in range(5):
+                if set_process_mute(hp.pid, False) > 0:
+                    break
+                time.sleep(0.2)
         request_tray_icon_restore(hp.pid)
         if main_hwnd and self._settings.activate_on_restore:
             win32.SetForegroundWindow(main_hwnd)
