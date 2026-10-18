@@ -103,7 +103,10 @@ def main() -> int:
 
     w = find_main(pid)
     if not w:
-        print(f"进程 pid={pid} 存在,但找不到主窗口。")
+        print(f"进程 pid={pid} 存在,但找不到任何主窗口。")
+        print("这种情况不是'最小化点不回来'(那种一定还有窗口),"
+              "而是游戏本身没正常起来。")
+        print(f"建议:任务管理器里结束 NarakaBladepoint.exe(pid={pid}),再启动游戏。")
         _pause()
         return 1
 
