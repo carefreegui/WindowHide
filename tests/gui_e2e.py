@@ -110,8 +110,11 @@ def write_config(mods: int, vk: int) -> None:
     APPDATA.mkdir(parents=True, exist_ok=True)
     cfg = {
         "version": 1,
+        "hotkey_mode": "toggle",
         "hotkey_toggle": {"mods": mods, "vk": vk},
-        "hotkey_foreground": {"mods": 0, "vk": 0},
+        "hotkey_hide": {"mods": mods, "vk": vk},
+        "hotkey_restore": {"mods": mods, "vk": vk},
+        "hotkey_hide_self": {"mods": 0, "vk": 0},
         "mute_on_hide": False,
         "keep_hidden": True,
         "activate_on_restore": False,

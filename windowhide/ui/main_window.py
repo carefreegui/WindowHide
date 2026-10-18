@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
         self._btn_hide = QPushButton("隐藏勾选")
         # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
         # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
-        self._btn_restore = QPushButton("恢复全部")
+        self._btn_restore = QPushButton("恢复")
         self._btn_save_target = QPushButton("保存为目标")
         self._btn_settings = QPushButton("设置")
         for b in (self._btn_hide, self._btn_restore,
@@ -89,13 +89,9 @@ class MainWindow(QMainWindow):
         self._btn_all = QPushButton("全选")
         self._btn_all.setToolTip("点击全选;再次点击取消全选")
         self._btn_invert = QPushButton("反选")
-        self._btn_fg = QPushButton("隐藏前台窗口")
-        self._btn_restore_fg = QPushButton("恢复前台窗口")
         bottom.addWidget(self._btn_all)
         bottom.addWidget(self._btn_invert)
         bottom.addStretch(1)
-        bottom.addWidget(self._btn_fg)
-        bottom.addWidget(self._btn_restore_fg)
         v.addLayout(bottom)
 
         self.setStatusBar(QStatusBar())
@@ -107,8 +103,6 @@ class MainWindow(QMainWindow):
         self._btn_settings.clicked.connect(self._open_settings)
         self._btn_all.clicked.connect(self._table.toggle_all_checked)
         self._btn_invert.clicked.connect(self._table.invert_checked)
-        self._btn_fg.clicked.connect(self._hide_foreground)
-        self._btn_restore_fg.clicked.connect(self._restore_foreground)
         self._search.textChanged.connect(self._apply_filter)
         self._type_filter.currentIndexChanged.connect(self._apply_filter)
         self._table.row_activated.connect(self._toggle_hwnd)
@@ -119,7 +113,7 @@ class MainWindow(QMainWindow):
         self._hotkeys.register_failed.connect(self._on_hotkey_failed)
 
         self._tray.act_toggle.triggered.connect(self._toggle_targets)
-        self._tray.act_hide_fg.triggered.connect(self._hide_foreground)
+        self._tray.act_hide_self.triggered.connect(self._hide_self)
         self._tray.act_show.triggered.connect(self._show_window)
         self._tray.act_quit.triggered.connect(self._quit)
         self._tray.activated.connect(self._on_tray_activated)
@@ -212,20 +206,17 @@ class MainWindow(QMainWindow):
         else:
             self._controller.hide_hwnds([hwnd])
 
-    def _hide_foreground(self) -> None:
-        if not self._controller.hide_foreground():
-            QMessageBox.information(
-                self, "提示",
-                "当前前台窗口就是本工具自身,没有可隐藏的目标。\n"
-                "请先激活要隐藏的窗口(如浏览器),再用此功能。")
+    def _hide_self(self) -> None:
+        """把本工具主窗口收进托盘(与点叉号等效)。
 
-    def _restore_foreground(self) -> None:
-        if not self._controller.restore_last_foreground():
-            QMessageBox.information(
-                self, "提示",
-                "没有通过「隐藏前台窗口」藏起来的窗口可恢复。\n"
-                "被本工具隐藏的窗口都会显示在列表里(状态:已隐藏),"
-                "双击该行也可以恢复。")
+        曾经的"隐藏前台窗口"是个语义陷阱:从托盘菜单触发时,
+        GetForegroundWindow 拿到的是任务栏/桌面(explorer),
+        一键把桌面都藏了(用户实测踩坑);在主界面点又会藏掉自己。
+        用户真正想要的就是这个 —— 工具自藏到托盘。
+        """
+        self.hide()
+        if self._config.show_balloon:
+            self._tray.showMessage("窗口隐藏工具", "已收进托盘,双击图标唤回主界面")
 
     def _save_targets(self) -> None:
         hwnds = self._table.checked_hwnds()
@@ -255,21 +246,28 @@ class MainWindow(QMainWindow):
 
     def _apply_hotkeys(self) -> None:
         c = self._config
-        # 只保留两个热键:切换(隐藏/恢复一体)+ 隐藏前台窗口。
-        # 曾经的"隐藏键/恢复键"分离模式已按用户反馈删除——
-        # 旧版在默认模式下填了也不注册,纯误导。
-        specs = {
-            "toggle": (c.hotkey_toggle.mods, c.hotkey_toggle.vk),
-            "foreground": (c.hotkey_foreground.mods, c.hotkey_foreground.vk),
-        }
+        # toggle 模式:一个键反复切换;split 模式:隐藏键 + 恢复键分开。
+        # 另有一个"隐藏本工具"(收进托盘),与模式无关,始终注册。
+        specs = {"hide_self": (c.hotkey_hide_self.mods, c.hotkey_hide_self.vk)}
+        if c.hotkey_mode == "split":
+            specs["hide"] = (c.hotkey_hide.mods, c.hotkey_hide.vk)
+            specs["restore"] = (c.hotkey_restore.mods, c.hotkey_restore.vk)
+        else:
+            specs["toggle"] = (c.hotkey_toggle.mods, c.hotkey_toggle.vk)
         self._hotkeys.set_hotkeys(specs)
 
     # ---------------------------------------------------------------- 信号
     def _on_hotkey(self, action: str) -> None:
         if action == "toggle":
             self._toggle_targets()
-        elif action == "foreground":
-            self._hide_foreground()
+        elif action == "hide":
+            hwnds = self._current_targets()
+            if hwnds:
+                self._controller.hide_hwnds(hwnds)
+        elif action == "restore":
+            self._controller.restore_all()
+        elif action == "hide_self":
+            self._hide_self()
 
     def _on_hotkey_failed(self, actions: str) -> None:
         # 状态栏消息一闪而过,用户根本注意不到(曾因此以为"快捷键坏了")。

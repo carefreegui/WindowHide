@@ -17,11 +17,11 @@ class SystemTray(QSystemTrayIcon):
 
         self.menu = QMenu()
         self.act_toggle = QAction("隐藏目标 / 恢复全部", self.menu)
-        self.act_hide_fg = QAction("隐藏当前前台窗口", self.menu)
+        self.act_hide_self = QAction("最小化到托盘", self.menu)
         self.act_show = QAction("显示主界面", self.menu)
         self.act_quit = QAction("退出", self.menu)
         self.menu.addAction(self.act_toggle)
-        self.menu.addAction(self.act_hide_fg)
+        self.menu.addAction(self.act_hide_self)
         self.menu.addSeparator()
         self.menu.addAction(self.act_show)
         self.menu.addSeparator()

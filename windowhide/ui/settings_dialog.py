@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QLabel, QListWidget, QListWidgetItem, QPushButton, QRadioButton,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -45,31 +45,57 @@ class SettingsDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
 
+        mode_box = QGroupBox("模式")
+        mv = QVBoxLayout(mode_box)
+        self._mode_toggle = QRadioButton("单一快捷键:反复按同一个键,隐藏 / 恢复切换")
+        self._mode_split = QRadioButton("两个快捷键:分别设置「隐藏键」和「恢复键」")
+        if self._config.hotkey_mode == "split":
+            self._mode_split.setChecked(True)
+        else:
+            self._mode_toggle.setChecked(True)
+        mv.addWidget(self._mode_toggle)
+        mv.addWidget(self._mode_split)
+        v.addWidget(mode_box)
+
         form = QFormLayout()
         self._cap_toggle = HotkeyCaptureButton(self._config.hotkey_toggle)
+        self._cap_hide = HotkeyCaptureButton(self._config.hotkey_hide)
+        self._cap_restore = HotkeyCaptureButton(self._config.hotkey_restore)
         form.addRow("切换键:", self._cap_toggle)
-        tip_mode = QLabel("反复按切换键:有隐藏中的目标则恢复,否则隐藏。"
-                          "隐藏/恢复也可用主界面按钮与托盘菜单。")
-        tip_mode.setWordWrap(True)
-        tip_mode.setStyleSheet("color: #64748b;")
+        form.addRow("隐藏键:", self._cap_hide)
+        form.addRow("恢复键:", self._cap_restore)
+        self._hotkey_form = form
         v.addLayout(form)
-        v.addWidget(tip_mode)
+        # 模式切换时显隐输入行:选"单一"只显示切换键,
+        # 选"两个"才出现隐藏键/恢复键(旧版三个框并列,填了不生效,纯误导)
+        self._mode_toggle.toggled.connect(self._sync_hotkey_rows)
+        self._mode_split.toggled.connect(self._sync_hotkey_rows)
+        self._sync_hotkey_rows()
 
         extra = QGroupBox("附加")
         ev = QVBoxLayout(extra)
-        self._cap_fg = HotkeyCaptureButton(self._config.hotkey_foreground)
+        self._cap_self = HotkeyCaptureButton(self._config.hotkey_hide_self)
         row = QHBoxLayout()
-        row.addWidget(QLabel("隐藏前台窗口:"))
-        row.addWidget(self._cap_fg)
+        row.addWidget(QLabel("隐藏本工具(收进托盘):"))
+        row.addWidget(self._cap_self)
         row.addStretch(1)
         ev.addLayout(row)
-        tip = QLabel("提示:全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。")
+        tip = QLabel("「隐藏本工具」= 把本工具主窗口收进系统托盘(不是藏别人窗口),"
+                     "与点右上角叉号等效;双击托盘图标可唤回。\n"
+                     "提示:全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #64748b;")
         ev.addWidget(tip)
         v.addWidget(extra)
         v.addStretch(1)
         return w
+
+    def _sync_hotkey_rows(self) -> None:
+        """按模式显隐输入行:单一快捷键只显示切换键,两个快捷键才显示隐藏/恢复键。"""
+        split = self._mode_split.isChecked()
+        self._hotkey_form.setRowVisible(self._cap_toggle, not split)
+        self._hotkey_form.setRowVisible(self._cap_hide, split)
+        self._hotkey_form.setRowVisible(self._cap_restore, split)
 
     def _behavior_tab(self) -> QWidget:
         w = QWidget()
@@ -146,8 +172,11 @@ class SettingsDialog(QDialog):
 
     # ---------------------------------------------------------------- 导出
     def apply_to(self, config: Config) -> None:
+        config.hotkey_mode = "split" if self._mode_split.isChecked() else "toggle"
         config.hotkey_toggle = self._cap_toggle.spec()
-        config.hotkey_foreground = self._cap_fg.spec()
+        config.hotkey_hide = self._cap_hide.spec()
+        config.hotkey_restore = self._cap_restore.spec()
+        config.hotkey_hide_self = self._cap_self.spec()
         config.mute_on_hide = self._cb_mute.isChecked()
         config.keep_hidden = self._cb_keep.isChecked()
         config.activate_on_restore = self._cb_activate.isChecked()

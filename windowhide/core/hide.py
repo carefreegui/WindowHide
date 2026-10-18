@@ -170,12 +170,20 @@ class HideController(QObject):
     def hide_foreground(self) -> int:
         """隐藏当前前台窗口所属的进程。
 
-        防自藏:在主界面点「隐藏前台窗口」按钮的瞬间,前台窗口就是
-        本工具自己 —— 不拦这一下的话,工具会把自个儿藏掉,界面直接
-        消失,用户完全不知道去哪恢复(用户实测踩坑)。
+        两道保护(用户实测"点一下连桌面都藏了"):
+        1. **桌面/任务栏不藏** —— 从托盘菜单触发时,GetForegroundWindow
+           拿到的是 Progman/WorkerW/Shell_TrayWnd(全是 explorer 的),
+           不拦这一下就会把桌面、任务栏连同所有资源管理器窗口一起藏掉;
+        2. **本工具自己不藏** —— 在主界面点按钮的瞬间,前台就是工具自己。
+
+        注意:本方法目前没有 UI 入口(主界面按钮/托盘菜单/快捷键都已
+        按用户反馈改为"工具自藏到托盘"),保留为 core 能力备用。
         """
         hwnd = win32.GetForegroundWindow()
         if hwnd:
+            if win32.get_class_name(hwnd) in ("Progman", "WorkerW",
+                                              "Shell_TrayWnd"):
+                return 0
             pid = win32.get_window_pid(hwnd)
             if pid == os.getpid():
                 return 0
