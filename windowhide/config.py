@@ -88,7 +88,12 @@ class Config:
     @classmethod
     def from_dict(cls, d: dict) -> "Config":
         c = cls()
-        c.hotkey_mode = d.get("hotkey_mode", "toggle")
+        if not isinstance(d, dict):
+            return c
+        mode = d.get("hotkey_mode", "toggle")
+        # 类型不对就当没设置:脏值(数字/None)会让按模式显隐输入行
+        # 之类的地方拿到意料之外的值
+        c.hotkey_mode = mode if isinstance(mode, str) else "toggle"
         for key in ("hotkey_toggle", "hotkey_hide", "hotkey_restore",
                     "hotkey_hide_self"):
             if key in d and isinstance(d[key], dict):
@@ -99,9 +104,12 @@ class Config:
             c.hotkey_hide_self = HotkeySpec.from_dict(d["hotkey_foreground"])
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",
                     "minimize_to_tray", "show_balloon", "autostart"):
-            if key in d:
-                setattr(c, key, bool(d[key]))
-        c.targets = [TargetRule.from_dict(t) for t in d.get("targets", []) if isinstance(t, dict)]
+            # 只认真正的布尔值:bool("yes") 会静默变成 True,把用户
+            # 手改坏的配置读成"开",排查起来极其费劲
+            if isinstance(d.get(key), bool):
+                setattr(c, key, d[key])
+        c.targets = [TargetRule.from_dict(t) for t in d.get("targets", [])
+                     if isinstance(t, dict)] if isinstance(d.get("targets"), list) else []
         return c
 
     def save(self) -> None:

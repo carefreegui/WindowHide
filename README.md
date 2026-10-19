@@ -1,9 +1,24 @@
 # 窗口隐藏工具(WindowHide / 老板键)
 
+> A Windows window-hiding tool ("boss key") written in pure Win32 ctypes + PySide6.
+> Pick windows from a live list, hide them from the taskbar / Alt+Tab / tray, keep the
+> programs running, and bring them back with a global hotkey. No input injection,
+> no DLL hooking — only documented Win32 APIs.
+> [中文说明见下](#窗口隐藏工具windowhide--老板键)
+
 一个 Windows 桌面窗口管理工具:勾选目标窗口,一键把它们从**任务栏和系统托盘**里
 完全隐藏,程序继续在后台正常运行;再用**全局快捷键**或**托盘图标点击**一键恢复。
 
 > 隐藏 = "后台化",不是关闭。目标程序的功能、下载、播放、计算全部不受影响。
+
+![主界面](docs/screenshot.png)
+
+<details>
+<summary>设置界面</summary>
+
+![设置](docs/settings.png)
+
+</details>
 
 ## 功能
 
@@ -33,20 +48,28 @@
 
 - Windows 10 / 11(64 位)
 - Python 3.10+,依赖:`PySide6>=6.5`(见 `requirements.txt`)
-- 建议以**管理员身份**运行:否则无权操作管理员权限启动的程序窗口
+- **目标程序以管理员权限运行时,本工具也必须以管理员身份运行**(否则 UIPI
+  会拦掉所有窗口操作)。托盘菜单里有「以管理员身份重启」一键切换。
 
 ## 快速开始
 
 ```bash
-# 1. 装依赖(任选其一)
-pip install -r requirements.txt
-pip install -i https://mirrors.aliyun.com/pypi/simple/ PySide6
+# 1. 建虚拟环境并装依赖(推荐,run.bat 会优先用它)
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+
+# 国内网络慢的话换镜像
+.venv\Scripts\pip install -i https://mirrors.aliyun.com/pypi/simple/ PySide6
 
 # 2. 启动(无控制台窗口)
 run.bat
 # 或者
-python run.pyw
+.venv\Scripts\python run.pyw
 ```
+
+`run.bat` 会依次找:项目内 `.venv` → PATH 里的 `pythonw.exe` → `pyw -3`,
+并且**要求候选解释器真的能 `import PySide6`**（否则 pythonw 会静默失败,
+连个错都不给)。
 
 启动后:
 
@@ -61,8 +84,11 @@ python run.pyw
 
 ```
 windowhide/
-├── run.pyw / run.bat         # 入口
+├── run.pyw / run.bat         # 入口(run.bat 自动探测带 PySide6 的解释器)
 ├── requirements.txt
+├── LICENSE                   # MIT
+├── docs/                     # README 用的界面截图
+├── .github/workflows/        # CI:纯逻辑测试(需真实桌面的不进去)
 ├── windowhide/
 │   ├── app.py                # 引导:QLocale 修复 / 单实例 / 装配
 │   ├── config.py             # JSON 配置(%APPDATA%\WindowHide\config.json)
@@ -82,6 +108,7 @@ windowhide/
 │       ├── tray.py           #   系统托盘
 │       └── icon.py           #   程序绘制图标(无外部资源)
 └── tests/
+    ├── logic_test.py         # 纯逻辑单元测试(分类/匹配/配置/热键文案,可进 CI)
     ├── smoke_test.py         # 冒烟测试(枚举/分类/配置/托盘通路)
     ├── integration_test.py   # 真实窗口隐藏恢复 + 托盘移除恢复 + 热键模拟
     ├── audio_test.py         # 静音功能测试(播音探针 + 静音/取消/状态查询)
@@ -111,7 +138,7 @@ windowhide/
 Alt+Tab 中。恢复时两者都会还原。即使目标程序自己调 `ShowWindow(SW_SHOW)`,
 工具窗口样式也能保证它不会回到任务栏(看门狗每秒复查,可关)。
 
-**全屏游戏藏不掉?独占全屏根本不看窗口可见性** 用户实测:全屏游戏按隐藏,
+**全屏游戏藏不掉?独占全屏根本不看窗口可见性** 全屏游戏按隐藏,
 声音静了、画面还在屏幕上。原因:独占全屏的游戏由 D3D/DXGI 直接把画面翻转
 输出到显示器,`WS_VISIBLE` 与最终画面是两条路 —— 把窗口 `SW_HIDE` 掉,
 窗口"看不见了",游戏却照旧渲染。
@@ -143,7 +170,7 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 在 vtable 索引 5(前面有两个方法),`IAudioSessionControl2::GetProcessId`
 在索引 14(前面有 11 个方法)。*
 
-**浏览器静不了音?因为音频不在主进程放** 用户实测:浏览器能隐藏但静不了音,
+**浏览器静不了音?因为音频不在主进程放** 现象:浏览器能隐藏但静不了音,
 游戏却能静。原因:Chromium 系(Edge/Chrome)的声音由 **audio service 子进程**
 播放(实测 Edge 主 pid 零会话,2 个会话全在子进程上),按主窗口 pid 找会话
 当然静不了;游戏是主进程直接放音频,所以旧逻辑对游戏有效。
@@ -160,7 +187,7 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 避免对全系统窗口逐个发消息。
 
 **热键** 独立线程建消息窗口 + `RegisterHotKey`,`MOD_NOREPEAT` 防连发;收到 `WM_HOTKEY` 后通过 Qt 信号转主线程执行,响应延迟在毫秒级。
-*踩坑记录(用户实测"改设置后快捷键没反应"):窗口类名必须按线程唯一化 ——
+*踩坑记录(实测"改设置后快捷键没反应"):窗口类名必须按线程唯一化 ——
 同进程内第二次 `RegisterClassW` 同名类必然失败,旧线程还没退出完时新线程
 起不来,旧热键已注销、新热键没注册,热键整个静默死掉。现在类名带线程序号,
 且线程起不来/注册失败必须写日志 + 发信号(托盘气泡提示),绝不允许静默;
@@ -172,7 +199,7 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 不合格的丢弃。否则工具重启后"还藏着的窗口"会变成孤儿 —— 界面不显示、
 热键恢复找不到目标,只能手动重启目标程序。
 
-**`GetForegroundWindow` 在托盘菜单场景是个陷阱** 用户实测:从托盘菜单点
+**`GetForegroundWindow` 在托盘菜单场景是个陷阱** 现象:从托盘菜单点
 "隐藏当前前台窗口",一键把**桌面、任务栏连同所有资源管理器窗口**全藏了。
 原因:菜单弹出的瞬间前台窗口变成 explorer 的 Progman / Shell_TrayWnd,
 按 pid 藏进程 = 藏整个 explorer。同理,在主界面点按钮时前台是工具自己,
@@ -180,7 +207,7 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 全部撤掉,改为用户真正想要的「隐藏本工具(收进托盘)」;core 的
 `hide_foreground` 保留但加了桌面/任务栏/自身三重保护备用。*
 
-**目标程序以管理员权限运行时,我们能做的极其有限(UIPI)** 用户实测:永劫无间
+**目标程序以管理员权限运行时,我们能做的极其有限(UIPI)** 现象:永劫无间
 (全屏,管理员权限运行)点隐藏后"只最小化到桌面、还点不回来"。
 排查结论:`OpenProcess(PROCESS_VM_READ)` 对它返回 **错误 5**,
 而工具自身是普通权限 —— UIPI 把 `SetWindowLongPtrW`(加 TOOLWINDOW)、
@@ -209,7 +236,15 @@ uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreate
 
 ## 测试
 
+分两类。**需要真实 Windows 桌面会话的**(隐藏/恢复/静音/热键注入/全屏)在
+CI 里跑不了 —— headless runner 没有交互式桌面,硬塞进去只会常年红灯 ——
+所以 CI 只跑纯逻辑那部分,其余请在本机手动跑。
+
 ```bash
+# 纯逻辑(无窗口、无桌面,CI 会跑):分类/匹配/配置/热键文案
+python tests/logic_test.py
+
+# 以下都需要真实桌面
 python tests/smoke_test.py        # 冒烟:枚举/分类/配置/托盘通路
 python tests/integration_test.py  # 集成:测试窗口隐藏恢复 + 托盘移除恢复 + 热键
 python tests/audio_test.py        # 静音:播音探针静音/取消/状态查询
@@ -220,14 +255,15 @@ python tests/hang_test.py         # 无响应窗口不阻塞(挂起探针)
 python tests/hotkey_rereg_test.py # 热键重复注册:5 连改不静默死亡
 python tests/hide_state_test.py   # 隐藏状态持久化:重启/多实例/过期清理
 python tests/foreground_test.py   # 前台窗口隐藏 core:桌面/任务栏/自身保护
-python tests/fullscreen_test.py   # 全屏窗口:判定/先最小化再隐藏/恢复/失败上报
+python tests/fullscreen_test.py   # 全屏窗口:判定/先最小化再隐藏/恢复/失败上报/权限预检
 python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探测空闲热键按键验证
 ```
 
-实测结果(Win11,Python 3.13 + PySide6 6.12):
+实测结果(Win11,Python 3.13 + PySide6 6.12,12 个测试全绿):
 
 | 测试 | 结果 |
 | --- | --- |
+| 纯逻辑(分类/匹配/配置往返/旧版迁移/脏数据/热键文案) | 36/36 通过 |
 | 冒烟(枚举/分类/配置/托盘通路自检) | 全部通过 |
 | 集成(隐藏/恢复/样式还原/托盘删除与重注册/热键链路) | 12/12 通过 |
 | 静音(静音→取消→状态查询,连跑 3 次稳定) | 全部通过 |
@@ -271,3 +307,19 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
   该程序即可,不影响窗口隐藏/恢复本身。
 - **想开机自启?** 设置 → 行为 → 勾选"开机自动启动"(写当前用户注册表 Run 项,
   不需要管理员)。
+
+## 边界与免责
+
+这是一个**本机窗口管理工具**,只做三件事:改目标窗口的显示状态、按进程移除
+托盘图标、调系统音量合成器的静音开关。它**不注入 DLL、不挂钩子、不模拟
+键盘鼠标**去操控目标程序,也不碰任何网络。
+
+- 因为不注入,它对"独占全屏游戏""管理员权限程序"这类目标只能尽力而为,
+  做不到的会在气泡里如实说,不会假装成功。
+- 请只在**自己有权操作的设备**上使用。拿它偷窥、规避监护或规避审计不在
+  支持范围内,也不被作者认可。
+- 隐藏不等于隐身:目标程序仍在运行,任务管理器、资源监视器照样看得见。
+
+## 许可证
+
+[MIT](LICENSE)

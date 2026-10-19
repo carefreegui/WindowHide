@@ -71,7 +71,22 @@ def _grab(hdc_src_getter, width: int, height: int) -> bytes:
     return bytes(raw)
 
 
+def _make_dpi_aware() -> None:
+    """声明 DPI 感知。
+
+    本机缩放 150%:Qt 程序是 per-monitor-v2 感知的,而我们这个进程默认是
+    不感知的 —— `GetWindowRect` 会返回"逻辑尺寸"(980x620),`PrintWindow`
+    却按物理像素渲染(1470x930),结果截出来只剩左上角一块。
+    必须在取矩形之前声明感知(只需一次,重复调用无副作用)。
+    """
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def capture_screen(path: str) -> tuple[int, int]:
+    _make_dpi_aware()
     user32 = ctypes.windll.user32
     width = user32.GetSystemMetrics(0)
     height = user32.GetSystemMetrics(1)
@@ -83,13 +98,22 @@ def capture_screen(path: str) -> tuple[int, int]:
 
 def capture_window(path: str, title: str) -> tuple[int, int]:
     """用 PrintWindow 截取指定标题的窗口(可截被遮挡的窗口)。"""
+    _make_dpi_aware()
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     hwnd = user32.FindWindowW(None, title)
     if not hwnd:
         raise RuntimeError(f"找不到窗口: {title}")
 
-    rect = wintypes.RECT()
+    # 本工具在 core/win32.py 里给 GetWindowRect 声明过 argtypes(POINTER(它自己的
+    # RECT)),ctypes 会按类型严格校验 —— 这里必须用同一个结构体,否则报
+    # "expected LP_RECT instance instead of pointer to RECT"。
+    try:
+        from windowhide.core.win32 import RECT as _RECT
+    except Exception:
+        _RECT = wintypes.RECT
+
+    rect = _RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(rect))
     width, height = rect.right - rect.left, rect.bottom - rect.top
     if width <= 0 or height <= 0:

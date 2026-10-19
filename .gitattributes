@@ -1,0 +1,18 @@
+# 统一换行符,避免 Windows 上反复出现 "LF will be replaced by CRLF" 噪音
+* text=auto
+
+# .bat 必须是 CRLF,否则某些环境下 cmd 解析会出问题
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / Markdown / YAML 用 LF
+*.py  text eol=lf
+*.pyw text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 二进制
+*.png binary
+*.ico binary
+*.jpg binary

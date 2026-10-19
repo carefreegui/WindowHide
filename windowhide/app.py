@@ -43,7 +43,34 @@ def _wake_existing() -> None:
         user32.PostMessageW(hwnd, msg, 0, 0)
 
 
+def _install_excepthook() -> None:
+    """全局异常兜底:写日志,别让异常静默消失。
+
+    PySide6 里槽函数抛出的异常会被 Qt 吞掉(打包成无控制台运行后连
+    提示都没有),用户只会看到"点了没反应"。装了钩子至少日志里留痕,
+    反馈 bug 时能拿到现场。
+    """
+    import threading
+    import traceback
+
+    from .log import write
+
+    def _hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb)).strip()
+        write("未捕获异常:\n" + text)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    def _thread_hook(args):
+        text = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback)).strip()
+        write(f"线程 {getattr(args.thread, 'name', '?')} 未捕获异常:\n" + text)
+
+    sys.excepthook = _hook
+    threading.excepthook = _thread_hook
+
+
 def main() -> int:
+    _install_excepthook()
     _fix_qt_locale()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

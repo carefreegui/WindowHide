@@ -1,6 +1,23 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# 测试产物
 tests/probe_state.json
 tests/audio_probe_state.json
 windowhide.log
+*.log
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 本地助手/会话数据
 .workbuddy/
