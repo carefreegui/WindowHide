@@ -107,6 +107,8 @@ class SettingsDialog(QDialog):
         self._cb_tray = QCheckBox("关闭主界面时最小化到系统托盘(不退出)")
         self._cb_balloon = QCheckBox("隐藏 / 恢复时弹出托盘气泡提示")
         self._cb_autostart = QCheckBox("开机自动启动(写入当前用户注册表 Run 项)")
+        self._cb_force_fs = QCheckBox(
+            "强制隐藏独占全屏游戏(先最小化再隐藏,可能让游戏失去响应)")
 
         self._cb_mute.setChecked(self._config.mute_on_hide)
         self._cb_keep.setChecked(self._config.keep_hidden)
@@ -114,10 +116,17 @@ class SettingsDialog(QDialog):
         self._cb_tray.setChecked(self._config.minimize_to_tray)
         self._cb_balloon.setChecked(self._config.show_balloon)
         self._cb_autostart.setChecked(self._config.autostart)
+        self._cb_force_fs.setChecked(self._config.force_fullscreen_hide)
+        self._cb_force_fs.setToolTip(
+            "独占全屏(DirectX 独占模式)的游戏不看窗口可见性,只能先最小化逼它\n"
+            "掉出全屏再隐藏。但部分游戏最小化后就不再处理消息:游戏自己回不来,\n"
+            "本工具也可能卡住。默认关闭 —— 关着的时候遇到这种游戏只会提示\n"
+            "「没藏掉」,不会去动它。")
 
         for cb in (self._cb_mute, self._cb_keep, self._cb_activate,
                    self._cb_tray, self._cb_balloon, self._cb_autostart):
             v.addWidget(cb)
+        v.addWidget(self._cb_force_fs)
 
         note = QLabel("静音功能调用系统音量合成器接口,只影响目标程序的声音,"
                       "不影响其它程序和系统音量。")
@@ -183,4 +192,5 @@ class SettingsDialog(QDialog):
         config.minimize_to_tray = self._cb_tray.isChecked()
         config.show_balloon = self._cb_balloon.isChecked()
         config.autostart = self._cb_autostart.isChecked()
+        config.force_fullscreen_hide = self._cb_force_fs.isChecked()
         config.targets = list(self._rules)

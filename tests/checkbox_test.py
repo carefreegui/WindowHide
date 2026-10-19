@@ -147,7 +147,7 @@ def main() -> int:
     check("dummy 关闭后勾选被清理", target.hwnd not in table._checked)
 
     print("[7] 清理 ...")
-    controller.restore_all()
+    controller.restore_all(wait=True)
     hotkeys.stop()
     tray.hide()
     win.close()

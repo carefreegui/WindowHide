@@ -93,7 +93,7 @@ def main() -> int:
     check("再次点击后目标窗口恢复可见", win32.IsWindowVisible(target.hwnd))
 
     print("[4] 清理 ...")
-    controller.restore_all()
+    controller.restore_all(wait=True)
     hotkeys.stop()
     tray.hide()
     win.close()

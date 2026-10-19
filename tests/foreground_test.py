@@ -93,19 +93,19 @@ def main() -> int:
     if not force_foreground(target.hwnd):
         print("SKIP  无法把 dummy 设为前台(环境限制),跳过真实前台部分")
     else:
-        n = controller.hide_foreground()
+        n = controller.hide_foreground(wait=True)
         time.sleep(0.3)
         check("hide_foreground 隐藏了 dummy", n > 0)
         check("dummy 窗口不可见", not win32.IsWindowVisible(target.hwnd))
         check("记录了 _last_fg_pid", controller._last_fg_pid == target.pid)
 
         print("[3] 恢复前台窗口 ...")
-        ok = controller.restore_last_foreground()
+        ok = controller.restore_last_foreground(wait=True)
         time.sleep(0.3)
         check("restore_last_foreground 返回 True", ok)
         check("dummy 恢复可见", bool(win32.IsWindowVisible(target.hwnd)))
         check("重复调用返回 False(无重复恢复)",
-              not controller.restore_last_foreground())
+              not controller.restore_last_foreground(wait=True))
 
     print("[4] 防自藏:前台=本工具自己的窗口 ...")
     own = QWidget()
@@ -117,7 +117,7 @@ def main() -> int:
     if not force_foreground(own_hwnd):
         print("SKIP  无法把自己的窗口设为前台(环境限制),跳过防自藏验证")
     else:
-        n = controller.hide_foreground()
+        n = controller.hide_foreground(wait=True)
         time.sleep(0.3)
         check("前台是自己时 hide_foreground 返回 0(不藏自己)", n == 0)
         check("自己的窗口仍然可见", bool(win32.IsWindowVisible(own_hwnd)))
@@ -130,14 +130,14 @@ def main() -> int:
     elif not force_foreground(progman):
         print("SKIP  无法把桌面设为前台(环境限制),跳过桌面保护验证")
     else:
-        n = controller.hide_foreground()
+        n = controller.hide_foreground(wait=True)
         time.sleep(0.3)
         check("前台是桌面时 hide_foreground 返回 0(不藏桌面)", n == 0)
         check("explorer 进程未被误藏", controller.hidden_pids() == [])
         check("桌面窗口仍然可见", bool(win32.IsWindowVisible(progman)))
 
     print("[6] 清理 ...")
-    controller.restore_all()
+    controller.restore_all(wait=True)
     own.close()
     if find_dummy():
         dummy.kill()

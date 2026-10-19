@@ -33,8 +33,9 @@ def _pause() -> None:
         pass
 
 
-def find_pid() -> int:
-    """按进程名找游戏。找不到返回 0。"""
+def find_pid(name: str | None = None) -> int:
+    """按进程名找目标(默认找永劫无间)。找不到返回 0。"""
+    want = (name or "").lower()
     snap = win32.CreateToolhelp32Snapshot(win32.TH32CS_SNAPPROCESS, 0)
     if not snap or snap == -1:
         return 0
@@ -44,7 +45,8 @@ def find_pid() -> int:
     try:
         ok = win32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if any(h in entry.szExeFile.lower() for h in HINTS):
+            exe = entry.szExeFile.lower()
+            if (want and want in exe) or (not want and any(h in exe for h in HINTS)):
                 found = int(entry.th32ProcessID)
             ok = win32.Process32NextW(snap, ctypes.byref(entry))
     finally:
@@ -53,11 +55,16 @@ def find_pid() -> int:
 
 
 def find_main(pid: int):
+    """找主窗口:优先认得出的大作(Unity / Naraka),否则取面积最大的可见窗口。
+
+    不能只认固定类名 —— 别的游戏也想用这个脚本救命。
+    """
     best = None
     for w in win32.enum_process_windows_all(pid):
         if w.class_name == "UnityWndClass" or (w.title or "").startswith("Naraka"):
-            if best is None or (w.title or "").startswith("Naraka"):
-                best = w
+            return w
+        if w.visible and (best is None or w.size > best.size):
+            best = w
     return best
 
 
@@ -84,9 +91,10 @@ def fg_force(hwnd: int) -> None:
 
 
 def main() -> int:
-    pid = int(sys.argv[1]) if len(sys.argv) > 1 else find_pid()
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    pid = int(arg) if arg.isdigit() else find_pid(arg or None)
     if not pid:
-        print("没找到正在运行的永劫无间进程。")
+        print("没找到正在运行的目标进程。")
         _pause()
         return 1
 
@@ -94,7 +102,7 @@ def main() -> int:
     h = win32.OpenProcess(win32.PROCESS_VM_READ, False, pid)
     if not h:
         err = win32.GetLastError()
-        print(f"无法操作游戏进程(pid={pid},错误码 {err})。")
+        print(f"无法操作目标进程(pid={pid},错误码 {err})。")
         print("这通常意味着本脚本不是以管理员身份运行的 —— "
               "请右键 rescue_window.bat →「以管理员身份运行」。")
         _pause()
@@ -106,7 +114,7 @@ def main() -> int:
         print(f"进程 pid={pid} 存在,但找不到任何主窗口。")
         print("这种情况不是'最小化点不回来'(那种一定还有窗口),"
               "而是游戏本身没正常起来。")
-        print(f"建议:任务管理器里结束 NarakaBladepoint.exe(pid={pid}),再启动游戏。")
+        print(f"建议:任务管理器里结束该进程(pid={pid}),再启动游戏。")
         _pause()
         return 1
 
@@ -114,38 +122,57 @@ def main() -> int:
     print(f"目标: hwnd={hwnd} class={w.class_name} title={w.title!r}")
     print("  初始  ", state(hwnd))
 
-    win32.set_ex_style(hwnd, remove=win32.WS_EX_TOOLWINDOW)
+    # 关键:目标无响应时,同步窗口调用(SetWindowLongPtr / SetWindowPlacement)
+    # 会**一直等下去** —— 老版本就是卡在这一步。先判定,只用异步手段。
+    hung = win32.is_hung(hwnd)
+    if hung:
+        print("  ⚠ 目标窗口当前无响应(和任务管理器里显示的一致)。")
+        print("    只用异步调用(ShowWindowAsync / PostMessage),不会有阻塞风险,")
+        print("    但**能不能救回来取决于它自己什么时候恢复**。")
 
-    # 1) 直接改窗口放置状态(最可靠,不依赖程序处理消息)
-    wp = win32.WINDOWPLACEMENT()
-    wp.length = ctypes.sizeof(win32.WINDOWPLACEMENT)
-    if win32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-        wp.showCmd = win32.SW_SHOWNORMAL
-        ok = win32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+    if not hung:
+        win32.set_ex_style(hwnd, remove=win32.WS_EX_TOOLWINDOW)
+        print("  去掉 TOOLWINDOW", state(hwnd))
+
+    # 1) 系统命令还原(投递到队列,不等)
+    win32.PostMessageW(hwnd, win32.WM_SYSCOMMAND, 0xF120, 0)   # SC_RESTORE
+    # 2) 异步显示
+    win32.ShowWindowAsync(hwnd, win32.SW_RESTORE)
+    time.sleep(0.4)
+    print("  SC_RESTORE + SW_RESTORE", state(hwnd))
+
+    # 3) 直接改窗口放置状态 —— 只在目标响应时做(它会同步发消息)
+    if not hung:
+        ok = win32.set_placement_cmd(hwnd, win32.SW_SHOWNORMAL)
         time.sleep(0.4)
         print(f"  SetWindowPlacement ret={ok}", state(hwnd))
+    else:
+        print("  跳过 SetWindowPlacement(目标无响应,会阻塞)")
 
-    # 2) 异步还原 + 系统命令还原
-    win32.ShowWindowAsync(hwnd, win32.SW_RESTORE)
-    time.sleep(0.3)
-    win32.PostMessageW(hwnd, win32.WM_SYSCOMMAND, 0xF120, 0)   # SC_RESTORE
-    time.sleep(0.3)
-    print("  SW_RESTORE + SC_RESTORE", state(hwnd))
+    # 4) 再补两轮异步唤醒(有些游戏要连续几次)
+    for i in range(3):
+        win32.ShowWindowAsync(hwnd, win32.SW_SHOW)
+        win32.PostMessageW(hwnd, win32.WM_SYSCOMMAND, 0xF120, 0)
+        time.sleep(0.35)
+    print("  连续异步唤醒后", state(hwnd), "hung=", win32.is_hung(hwnd))
 
-    # 3) 抢前台(游戏拿到焦点才会重新进全屏)
-    fg_force(hwnd)
-    time.sleep(0.6)
-    print("  抢前台  ", state(hwnd), "fg=", win32.GetForegroundWindow() == hwnd)
+    # 5) 抢前台(目标响应时才做)
+    if not win32.is_hung(hwnd):
+        fg_force(hwnd)
+        time.sleep(0.4)
+        print("  抢前台  ", state(hwnd), "fg=", win32.GetForegroundWindow() == hwnd)
 
     n = set_process_mute(pid, False)
     print(f"  取消静音影响 {n} 个会话")
     print("最终    ", state(hwnd))
 
-    if not win32.IsIconic(hwnd):
-        print("\n已恢复。切回游戏看一下画面。")
+    if win32.is_hung(w.hwnd) or win32.IsIconic(w.hwnd):
+        print("\n没救回来。原因和目标程序的状态有关:")
+        print("  · hung=True 表示它主线程已经不理消息了 —— 任何外部手段都进不去,")
+        print("    这种只能结束进程重开(对局会丢,但窗口确实回不来)。")
+        print("  · 用任务管理器结束它即可,不影响本工具。")
     else:
-        print("\n还是最小化状态 —— 如果本脚本已经是管理员身份,可能游戏主线程"
-              "自身卡住,只能结束进程重开。")
+        print("\n已恢复。切回去看一下画面。")
     _pause()
     return 0
 

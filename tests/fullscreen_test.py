@@ -77,9 +77,11 @@ def main() -> int:
     print(f"    hwnd={fs.hwnd} pid={fs.pid} rect={(l, t, r, b)} "
           f"monitor={(ml, mt, mr, mb)}")
     check("全屏窗口被识别为全屏", win32.is_fullscreen_window(fs.hwnd))
-    check("全屏窗口走 minimize_then_hide 策略",
-          win32.hide_plan(fs.hwnd) == "minimize_then_hide",
-          win32.hide_plan(fs.hwnd))
+    check("默认策略只隐藏(不动最小化状态)",
+          win32.hide_plan(fs.hwnd) == "hide", win32.hide_plan(fs.hwnd))
+    check("开启「强制隐藏全屏游戏」后走 minimize_then_hide",
+          win32.hide_plan(fs.hwnd, allow_minimize=True) == "minimize_then_hide",
+          win32.hide_plan(fs.hwnd, allow_minimize=True))
     check("窗口尺寸覆盖整块显示器", (r - l) >= (mr - ml) * 0.95
           and (b - t) >= (mb - mt) * 0.95)
 
@@ -93,15 +95,16 @@ def main() -> int:
     check("普通窗口走直接隐藏策略", win32.hide_plan(normal.hwnd) == "hide",
           win32.hide_plan(normal.hwnd))
 
-    print("== 2. 隐藏全屏窗口 ==")
+    print("== 2. 隐藏全屏窗口(开启强制隐藏) ==")
     cfg = Config()
     cfg.mute_on_hide = False          # 别把测试进程自己(或别的)静音
     cfg.keep_hidden = False           # 测试期间不要后台反复补刀
+    cfg.force_fullscreen_hide = True  # 走"先最小化再隐藏"这条路
     controller = HideController(cfg)
     incomplete: list[tuple[int, str]] = []
     controller.hide_incomplete.connect(lambda n, h: incomplete.append((n, h)))
 
-    controller.hide_pids([fs.pid])
+    controller.hide_pids([fs.pid], wait=True)
     time.sleep(0.2)
     hp = controller._hidden.get(fs.pid)
     check("控制器记录了全屏进程", hp is not None)
@@ -113,7 +116,7 @@ def main() -> int:
     check("隐藏后进程仍存活", win32.process_is_alive(fs.pid))
 
     print("== 3. 恢复正常 ==")
-    controller.restore_pids([fs.pid])
+    controller.restore_pids([fs.pid], wait=True)
     time.sleep(0.4)
     check("恢复后窗口重新可见", bool(win32.IsWindowVisible(fs.hwnd)))
     check("恢复后不再最小化", not win32.IsIconic(fs.hwnd))
@@ -126,12 +129,12 @@ def main() -> int:
     # 挡住)、或者窗口被程序自己顶回来。这里用打桩确定性复现 —— 把
     # hide_window 换成什么都不做的空操作,窗口自然还留在屏幕上。
     real_hide = win32.hide_window
-    win32.hide_window = lambda hwnd: (
+    win32.hide_window = lambda hwnd, allow_minimize=False: (
         win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE),
         win32.get_window_placement_cmd(hwnd))
     try:
         incomplete.clear()
-        controller.hide_pids([normal.pid])
+        controller.hide_pids([normal.pid], wait=True)
         time.sleep(0.2)
         hp2 = controller._hidden.get(normal.pid)
         check("顽固窗口被记录(状态没丢)", hp2 is not None)
@@ -143,7 +146,7 @@ def main() -> int:
               bool(win32.IsWindowVisible(normal.hwnd)))
     finally:
         win32.hide_window = real_hide
-        controller.restore_all()
+        controller.restore_all(wait=True)
 
     print("== 5. 权限预检(UIPI)与半残回滚 ==")
     # 目标进程权限比我们高时,UIPI 会把窗口操作静默吃掉。System(pid=4)
@@ -165,7 +168,7 @@ def main() -> int:
           not (win32.get_window_styles(fs.hwnd)[1] & win32.WS_EX_TOOLWINDOW))
 
     print("== 6. 收尾 ==")
-    controller.restore_all()
+    controller.restore_all(wait=True)
     controller._timer.stop()
     for p in (fs_proc, normal_proc):
         p.kill()

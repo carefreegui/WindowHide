@@ -354,7 +354,9 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit(self) -> None:
-        self._controller.restore_all()
+        # 退出前必须**同步**把所有窗口放出来(必须是 wait=True:异步提交
+        # 后进程立刻就没了,窗口会永远留在隐藏状态)
+        self._controller.restore_all(wait=True)
         self._hotkeys.stop()
         self._tray.hide()
         from PySide6.QtWidgets import QApplication

@@ -56,7 +56,7 @@ def main() -> int:
     # 实例 1:隐藏
     print("[2] 实例 1 隐藏 dummy ...")
     c1 = HideController(cfg)
-    n = c1.hide_pids([target.pid])
+    n = c1.hide_pids([target.pid], wait=True)
     check("隐藏成功", n == 1)
     check("状态文件已写入", _state_path().exists())
     data = json.loads(_state_path().read_text(encoding="utf-8"))
@@ -70,7 +70,7 @@ def main() -> int:
 
     # 实例 2 恢复(这就是用户重启工具后的恢复路径)
     print("[4] 实例 2 恢复 ...")
-    n = c2.restore_pids([target.pid])
+    n = c2.restore_pids([target.pid], wait=True)
     check("新实例恢复成功", n == 1)
     time.sleep(0.3)
     check("窗口恢复可见", bool(win32.IsWindowVisible(target.hwnd)))

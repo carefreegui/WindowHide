@@ -63,6 +63,11 @@ class Config:
     minimize_to_tray: bool = True
     show_balloon: bool = True
     autostart: bool = False
+    # 强制隐藏全屏游戏:先把它最小化(逼出独占全屏)再隐藏。
+    # **默认关闭** —— 实测永劫无间被最小化后主线程不再处理消息,
+    # 游戏自己回不来、工具也跟着卡死。默认行为是"藏不掉就如实说",
+    # 至少不会把用户的对局搞没。
+    force_fullscreen_hide: bool = False
 
     # 目标规则
     targets: list[TargetRule] = field(default_factory=list)
@@ -82,6 +87,7 @@ class Config:
             "minimize_to_tray": self.minimize_to_tray,
             "show_balloon": self.show_balloon,
             "autostart": self.autostart,
+            "force_fullscreen_hide": self.force_fullscreen_hide,
             "targets": [t.to_dict() for t in self.targets],
         }
 
@@ -103,7 +109,8 @@ class Config:
         if "hotkey_foreground" in d and isinstance(d["hotkey_foreground"], dict):
             c.hotkey_hide_self = HotkeySpec.from_dict(d["hotkey_foreground"])
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",
-                    "minimize_to_tray", "show_balloon", "autostart"):
+                    "minimize_to_tray", "show_balloon", "autostart",
+                    "force_fullscreen_hide"):
             # 只认真正的布尔值:bool("yes") 会静默变成 True,把用户
             # 手改坏的配置读成"开",排查起来极其费劲
             if isinstance(d.get(key), bool):

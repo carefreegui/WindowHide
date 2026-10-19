@@ -72,7 +72,7 @@ def main() -> int:
     cfg = Config()
     cfg.mute_on_hide = False
     controller = HideController(cfg)
-    controller.hide_hwnds([win.hwnd])
+    controller.hide_hwnds([win.hwnd], wait=True)
     time.sleep(0.3)
 
     hidden = not win32.IsWindowVisible(win.hwnd)
@@ -85,7 +85,7 @@ def main() -> int:
     check("控制器记录了隐藏状态", controller.is_pid_hidden(win.pid))
 
     print("== 3. 恢复 ==")
-    controller.restore_all()
+    controller.restore_all(wait=True)
     time.sleep(0.3)
     restored = win32.IsWindowVisible(win.hwnd)
     ex_style2 = win32.GetWindowLongPtrW(win.hwnd, win32.GWL_EXSTYLE)

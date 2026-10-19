@@ -52,6 +52,9 @@ SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
 SWP_STATECHANGED = 0x8000
+# 目标窗口在别的线程时,把这次 SetWindowPos 投递到对方队列就返回,
+# 不在这里等它处理。目标无响应时,同步版会一直等下去(实测把整个 UI 冻死)。
+SWP_ASYNCWINDOWPOS = 0x4000
 
 MONITOR_DEFAULTTONEAREST = 0x00000002
 
@@ -137,6 +140,11 @@ IsWindow.restype = wintypes.BOOL
 IsIconic = user32.IsIconic
 IsIconic.argtypes = [wintypes.HWND]
 IsIconic.restype = wintypes.BOOL
+
+# Windows 自己的"未响应"判定(任务管理器里那个),比自建超时可靠
+IsHungAppWindow = user32.IsHungAppWindow
+IsHungAppWindow.argtypes = [wintypes.HWND]
+IsHungAppWindow.restype = wintypes.BOOL
 
 GetWindow = user32.GetWindow
 GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
@@ -666,6 +674,19 @@ def is_offscreen(hwnd: int) -> bool:
     return bool(IsIconic(hwnd))
 
 
+def is_hung(hwnd: int) -> bool:
+    """窗口所属线程是否已经"未响应"(和任务管理器里显示的一致)。
+
+    硬性前置检查:对未响应的窗口做**同步**窗口操作
+    (`SetWindowLongPtr` / `SetWindowPlacement` / 同步 `SetWindowPos`)会把
+    调用线程一起拖住 —— 实测工具整个界面变成"未响应",用户只能强杀。
+    窗口不存在也返回 True(没什么可操作的)。
+    """
+    if not IsWindow(hwnd):
+        return True
+    return bool(IsHungAppWindow(hwnd))
+
+
 def set_placement_cmd(hwnd: int, show_cmd: int) -> bool:
     """直接把窗口的显示状态改成 show_cmd(SetWindowPlacement)。
 
@@ -701,15 +722,20 @@ def force_foreground(hwnd: int) -> None:
             user32.AttachThreadInput(t_self, t_fg, False)
 
 
-def hide_plan(hwnd: int) -> str:
-    """隐藏策略。全屏窗口必须"先最小化、再隐藏",其它窗口直接隐藏。
+def hide_plan(hwnd: int, allow_minimize: bool = False) -> str:
+    """隐藏策略。
 
-    为什么全屏要绕这一下:独占全屏的游戏由 D3D/DXGI 直接把画面翻转输出
-    到显示器,根本不看窗口的 WS_VISIBLE —— 把窗口 SW_HIDE 掉,画面还在,
-    用户看到的就是"声音停了但游戏还在屏幕上"(实测踩坑)。
-    最小化是让游戏掉出独占全屏最可靠的手段(等价于点最小化/Alt+Tab),
-    退出独占后再 SW_HIDE 才真的消失。
+    `allow_minimize=True`(设置里的「强制隐藏全屏游戏」)时,全屏窗口走
+    "先最小化再隐藏";**默认关闭**。
+
+    为什么默认不走这条路:独占全屏的游戏由 D3D/DXGI 直接把画面翻转输出到
+    显示器,不看 WS_VISIBLE,所以得先最小化让它掉出独占全屏。但实测永劫
+    无间最小化后主线程就不再处理消息,后续调用全部卡死、游戏自己回不来 ——
+    比"藏不掉"糟得多。默认只做安全的那一半:SW_HIDE + 工具窗样式,
+    藏不住如实告诉用户,不动它的最小化状态。
     """
+    if not allow_minimize:
+        return "hide"
     return "minimize_then_hide" if is_fullscreen_window(hwnd) else "hide"
 
 
@@ -718,6 +744,21 @@ def _wait_offscreen(hwnd: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while True:
         if is_offscreen(hwnd):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _wait_hidden(hwnd: int, timeout: float) -> bool:
+    """轮询等待 SW_HIDE 真正生效(WS_VISIBLE 被清掉)。
+
+    和 `_wait_offscreen` 的区别:最小化立刻就算"离开屏幕",但异步的
+    SW_HIDE 要等目标线程处理完才落地。判"藏干净了"必须等这一个。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not IsWindowVisible(hwnd):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -735,16 +776,26 @@ def minimize_window(hwnd: int) -> None:
     ShowWindowAsync(hwnd, SW_MINIMIZE)
 
 
-def hide_window(hwnd: int) -> tuple[int, int]:
+def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
     """隐藏窗口:先加 WS_EX_TOOLWINDOW(移出任务栏/Alt+Tab),再隐藏。
 
     返回 (原扩展样式, 原显示命令),供恢复用。
+
+    两条铁律(用户实测"点一下整个界面未响应"之后加的):
+    1. **目标未响应就别碰** —— `SetWindowLongPtr`、同步 `SetWindowPos`
+       都要等目标线程处理,目标是死的就一起卡死。这种窗口直接返回,
+       让上层报"目标无响应",退出状态一律不动。
+    2. **能用异步就不用同步** —— `ShowWindowAsync` / `SWP_ASYNCWINDOWPOS`
+       把请求投递到对方队列就返回,绝不阻塞调用方线程。
     """
     ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
     show_cmd = get_window_placement_cmd(hwnd)
+    if is_hung(hwnd):
+        return ex_style, show_cmd      # 上层用 is_offscreen 判失败
+
     # 必须先判定策略再加样式:is_fullscreen_window 会把 WS_EX_TOOLWINDOW
     # 当作"辅助窗口"排除,先加样式的话自己就把判断废掉了。
-    plan = hide_plan(hwnd)
+    plan = hide_plan(hwnd, allow_minimize)
     set_ex_style(hwnd, add=WS_EX_TOOLWINDOW)
 
     if plan == "minimize_then_hide":
@@ -753,9 +804,10 @@ def hide_window(hwnd: int) -> tuple[int, int]:
         ShowWindowAsync(hwnd, SW_HIDE)  # 退出全屏后隐藏才有效
         SetWindowPos(hwnd, None, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-                     | SWP_NOACTIVATE | SWP_HIDEWINDOW)
-        _wait_offscreen(hwnd, 0.3)
-        if IsWindowVisible(hwnd) and IsIconic(hwnd):
+                     | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_ASYNCWINDOWPOS)
+        # 等 SW_HIDE 落地:异步投递后立刻检查会看到"还是可见"的旧状态,
+        # 误判成"藏不住"就白白回滚了(实测被自己的异步坑过)。
+        if not _wait_hidden(hwnd, 0.6) and IsIconic(hwnd):
             # 最小化生效了、隐藏没生效 = 半残状态:窗口在最小化里,而
             # WS_POPUP 的游戏窗口没有任务栏按钮、也不在 Alt+Tab 里,
             # 用户根本点不回来(永劫无间实测就是这么卡死的)。
@@ -763,26 +815,30 @@ def hide_window(hwnd: int) -> tuple[int, int]:
             _undo_hide(hwnd, ex_style, show_cmd)
         return ex_style, show_cmd
 
-    ShowWindow(hwnd, SW_HIDE)
+    ShowWindowAsync(hwnd, SW_HIDE)
     if not is_offscreen(hwnd):
-        # 兜底:同步调用可能被目标线程挡住,换异步 + SetWindowPos 再试
-        ShowWindowAsync(hwnd, SW_HIDE)
+        # 兜底:再投一次(异步,不会等目标线程)
         SetWindowPos(hwnd, None, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-                     | SWP_NOACTIVATE | SWP_HIDEWINDOW)
+                     | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_ASYNCWINDOWPOS)
     return ex_style, show_cmd
 
 
 def _undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
     """把没藏干净的操作撤回原样(去样式 + 拉回显示)。"""
-    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW, add=ex_style & WS_EX_TOOLWINDOW)
-    if not set_placement_cmd(hwnd, SW_SHOWNORMAL):
-        ShowWindowAsync(hwnd, SW_RESTORE)
+    if not is_hung(hwnd):
+        set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                     add=ex_style & WS_EX_TOOLWINDOW)
+        if set_placement_cmd(hwnd, SW_SHOWNORMAL):
+            return
+    ShowWindowAsync(hwnd, SW_RESTORE)
+    SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                 | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS)
 
 
 def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
     """恢复窗口:还原扩展样式,再按记录的命令显示。"""
-    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW, add=ex_style & WS_EX_TOOLWINDOW)
     cmd = show_cmd
     if cmd in (SW_HIDE, SW_SHOWMINNOACTIVE, SW_MINIMIZE):
         cmd = SW_SHOWNORMAL
@@ -790,12 +846,19 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
         cmd = SW_RESTORE  # 原来是最小化的,恢复成普通显示
     elif cmd in (SW_SHOWNOACTIVATE, SW_SHOWNA):
         cmd = SW_SHOWNOACTIVATE
-    # 优先用 SetWindowPlacement 直接改状态:被最小化的全屏游戏对
-    # ShowWindow(SW_SHOWNORMAL) 可能毫无反应(实测永劫无间)。
-    if not set_placement_cmd(hwnd, cmd):
-        # 退路用异步版:同步 ShowWindow 跨进程要等目标线程,
-        # 游戏主循环一卡就把本工具的 UI 冻住。
-        ShowWindowAsync(hwnd, cmd)
+
+    if not is_hung(hwnd):
+        set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                     add=ex_style & WS_EX_TOOLWINDOW)
+        # SetWindowPlacement 直接改状态:被最小化的全屏游戏对
+        # ShowWindow(SW_SHOWNORMAL) 可能毫无反应(实测永劫无间)。
+        if set_placement_cmd(hwnd, cmd):
+            return
+    # 目标未响应 / 改状态失败:只能投递异步请求,绝不在这里等
+    ShowWindowAsync(hwnd, cmd)
+    SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                 | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS)
 
 
 def is_hidden(hwnd: int) -> bool:
