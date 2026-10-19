@@ -87,7 +87,7 @@ windowhide/
 ├── run.pyw / run.bat         # 入口(run.bat 自动探测带 PySide6 的解释器)
 ├── requirements.txt
 ├── LICENSE                   # MIT
-├── docs/                     # README 用的界面截图
+├── docs/                     # 界面截图 + 路线图 + 需要真人配合的测试清单
 ├── .github/workflows/        # CI:纯逻辑测试(需真实桌面的不进去)
 ├── windowhide/
 │   ├── app.py                # 引导:QLocale 修复 / 单实例 / 装配
@@ -307,6 +307,15 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
   该程序即可,不影响窗口隐藏/恢复本身。
 - **想开机自启?** 设置 → 行为 → 勾选"开机自动启动"(写当前用户注册表 Run 项,
   不需要管理员)。
+
+## 开发状态与参与
+
+- 优化路线(含实测数据与验收标准):[`docs/ROADMAP.md`](docs/ROADMAP.md)
+- 需要真人配合的测试清单(游戏全屏、管理员权限、多显示器、长时间挂机):
+  [`docs/MANUAL_TESTS.md`](docs/MANUAL_TESTS.md)
+
+欢迎按测试清单里的步骤回报结果。**报问题时请附** `%APPDATA%\WindowHide\windowhide.log`
+的最后几十行 + 程序名 + 工具当时是否以管理员身份运行 —— 这三样基本就能定位。
 
 ## 边界与免责
 
