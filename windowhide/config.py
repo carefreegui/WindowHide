@@ -98,7 +98,10 @@ class Config:
     keep_hidden: bool = True
     activate_on_restore: bool = True
     minimize_to_tray: bool = True
-    show_balloon: bool = True
+    show_balloon: bool = True          # 隐藏/恢复时的气泡确认
+    # 关窗口时"已最小化到托盘"的提示。单独一个开关:很多人只想关掉这条
+    # 打扰,但保留隐藏/恢复的确认(绑在一起的话就得二选一)。
+    show_minimize_hint: bool = True
     autostart: bool = False
     # 强制隐藏全屏游戏:先把它最小化(逼出独占全屏)再隐藏。
     # **默认关闭** —— 实测永劫无间被最小化后主线程不再处理消息,
@@ -173,6 +176,7 @@ class Config:
             "activate_on_restore": self.activate_on_restore,
             "minimize_to_tray": self.minimize_to_tray,
             "show_balloon": self.show_balloon,
+            "show_minimize_hint": self.show_minimize_hint,
             "autostart": self.autostart,
             "force_fullscreen_hide": self.force_fullscreen_hide,
             "auto_apply_rules": self.auto_apply_rules,
@@ -199,8 +203,8 @@ class Config:
         if "hotkey_foreground" in d and isinstance(d["hotkey_foreground"], dict):
             c.hotkey_hide_self = HotkeySpec.from_dict(d["hotkey_foreground"])
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",
-                    "minimize_to_tray", "show_balloon", "autostart",
-                    "force_fullscreen_hide", "auto_apply_rules"):
+                    "minimize_to_tray", "show_balloon", "show_minimize_hint",
+                    "autostart", "force_fullscreen_hide", "auto_apply_rules"):
             # 只认真正的布尔值:bool("yes") 会静默变成 True,把用户
             # 手改坏的配置读成"开",排查起来极其费劲
             if isinstance(d.get(key), bool):

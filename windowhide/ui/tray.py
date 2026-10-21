@@ -6,14 +6,14 @@ import ctypes
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from .icon import make_icon
+from .icon import load_icon
 
 
 class SystemTray(QSystemTrayIcon):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._normal_icon = make_icon(64, hidden=False)
-        self._hidden_icon = make_icon(64, hidden=True)
+        self._normal_icon = load_icon(hidden=False)
+        self._hidden_icon = load_icon(hidden=True)
         self.setIcon(self._normal_icon)
         self.setToolTip("窗口隐藏工具")
 

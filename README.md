@@ -1,20 +1,28 @@
-# 窗口隐藏工具(WindowHide / 老板键)
+<div align="center">
 
-> A Windows window-hiding tool ("boss key") written in pure Win32 ctypes + PySide6.
-> Pick windows from a live list, hide them from the taskbar / Alt+Tab / tray, keep the
-> programs running, and bring them back with a global hotkey. No input injection,
-> no DLL hooking — only documented Win32 APIs.
-> [中文说明见下](#窗口隐藏工具windowhide--老板键)
+<img src="docs/icon.png" width="104" alt="WindowHide">
 
-一个 Windows 桌面窗口管理工具:勾选目标窗口,一键把它们从**任务栏和系统托盘**里
-完全隐藏,程序继续在后台正常运行;再用**全局快捷键**或**托盘图标点击**一键恢复。
+# WindowHide · 窗口隐藏工具
 
-> 隐藏 = "后台化",不是关闭。目标程序的功能、下载、播放、计算全部不受影响。
+**Windows 上的「老板键」:勾几个窗口,一键从任务栏、Alt+Tab、托盘里消失。**
+
+程序照常运行,下载、播放、直播都不受影响;需要时一个快捷键就回来。
+不注入 DLL、不挂钩子、不模拟键鼠 —— 只调用微软公开的 Win32 API。
+
+[![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4)](#运行环境)
+[![python](https://img.shields.io/badge/python-3.10%2B-3776ab)](#快速开始)
+[![license](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
+
+[快速开始](#快速开始) · [功能](#功能) · [场景](#场景推荐用法) · [配置](#配置文件) · [常见问题](#常见问题) · [设计笔记](docs/DESIGN.md) · [English](README.en.md)
+
+</div>
 
 ![主界面](docs/screenshot.png)
 
+> 隐藏 = **后台化**,不是关闭。
+
 <details>
-<summary>场景(一键切换"上班 / 游戏")与设置界面</summary>
+<summary>另外两张截图:场景设置 / 行为设置</summary>
 
 ![场景](docs/scenes.png)
 
@@ -53,15 +61,9 @@
   - 隐藏时同时静音目标程序(调用系统音量合成器接口,含子孙进程,恢复时自动取消)
 - **不打扰**
   - 只改窗口显示状态,不向目标程序发送任何按键/鼠标事件
-  - 关闭主界面默认最小化到托盘,不退出
+  - 关闭主界面默认最小化到托盘,不退出;那条「已最小化到托盘」的提示
+    可以单独关掉(设置 → 行为),不想看到任何气泡就两个开关都关
   - 退出时会自动恢复所有被隐藏的窗口
-
-## 运行环境
-
-- Windows 10 / 11(64 位)
-- Python 3.10+,依赖:`PySide6>=6.5`(见 `requirements.txt`)
-- **目标程序以管理员权限运行时,本工具也必须以管理员身份运行**(否则 UIPI
-  会拦掉所有窗口操作)。托盘菜单里有「以管理员身份重启」一键切换。
 
 ## 快速开始
 
@@ -89,11 +91,62 @@ run.bat
 2. 点「隐藏勾选」→ 勾选窗口全部后台化,列表状态变为"已隐藏"
 3. 按全局快捷键(默认 `Ctrl+Alt+H` 切换)或**单击托盘图标**恢复
 
-「场景 ▾ → 把勾选的窗口加入当前场景」把勾选窗口存成规则,以后点托盘菜单里的
-场景名就能一键隐藏这一批;
-直接用快捷键或托盘图标切换,不用每次手动勾选。
+想一键切换一整批窗口(上班 / 摸鱼 / 游戏)?看下面的 [场景](#场景推荐用法)。
 
-## 目录结构
+## 场景(推荐用法)
+
+一个场景 = 一批规则 + 要不要顺带静音。三步就能建好:
+
+1. 打开要藏的程序,在主界面**勾选**它的窗口
+2. 点「**场景 ▾**」→「新建场景…」,起个名字(上班 / 摸鱼 / 游戏)
+3. 以后在**托盘菜单 →「场景」** 里点一下,就切过去了(主界面也能切)
+
+切换的时候三件事同时发生,规则是写死的,没有隐藏开关:
+
+| | 行为 |
+| --- | --- |
+| **藏** | 该场景规则命中的窗口 |
+| **放** | **别的场景**之前藏起来的窗口(换场合就该换一批) |
+| **不动** | 你**手动勾选**藏的窗口 —— 那是你自己的临时决定,场景不该覆盖它 |
+
+场景可以带「顺带静音」:勾上后切到它时,把其中的程序一起静音,恢复时自动取消。
+
+设置里的 **规则持续生效**(默认关闭):打开后,目标程序关掉再重新打开,
+几秒内会被自动再藏一次。但你手动点过「恢复」的窗口不会被它抢回去。
+
+## 运行环境
+
+- Windows 10 / 11(64 位)
+- Python 3.10+,依赖:`PySide6>=6.5`(见 `requirements.txt`)
+- **目标程序以管理员权限运行时,本工具也必须以管理员身份运行**(否则 UIPI
+  会拦掉所有窗口操作)。托盘菜单里有「以管理员身份重启」一键切换。
+## 配置文件
+
+`%APPDATA%\WindowHide\config.json`,格式版本 **v2**:
+
+```jsonc
+{
+  "version": 2,
+  "active_profile": "上班",
+  "profiles": [
+    {"name": "上班", "mute": true,
+     "rules": [{"process": "Steam.exe", "window_class": "", "title_regex": "", "label": "Steam"}]},
+    {"name": "游戏", "mute": false, "rules": []}
+  ],
+  "protected_processes": ["某监控客户端.exe"]   // 永不隐藏的自定义补充
+}
+```
+
+v1(平铺 `targets`)的旧配置启动时**自动升级**,原文件备份成
+`config.v1.bak.json` —— 升级失败也不会把你手写的配置弄丢。
+## 急救:窗口卡在"最小化、点不回来"
+
+`tools/rescue_window.bat` 双击即可(会自己弹 UAC 提权),自动找到
+游戏进程 → `SetWindowPlacement` 拉回 → `SC_RESTORE` → 抢前台 → 取消静音。
+适用于本工具(或任何同类工具)把全屏游戏最小化后没恢复的场景。
+## 开发
+
+### 目录结构
 
 ```
 windowhide/
@@ -147,155 +200,7 @@ windowhide/
     └── rescue_window.py      #   同上,纯 Python 实现
 ```
 
-## 实现要点
-
-**隐藏为什么任务栏会消失?** 两个动作叠加:`ShowWindow(SW_HIDE)` 让窗口不可见,
-再给窗口加 `WS_EX_TOOLWINDOW` 扩展样式——带该样式的顶层窗口不出现在任务栏和
-Alt+Tab 中。恢复时两者都会还原。即使目标程序自己调 `ShowWindow(SW_SHOW)`,
-工具窗口样式也能保证它不会回到任务栏(看门狗每秒复查,可关)。
-
-**全屏游戏藏不掉?独占全屏根本不看窗口可见性** 全屏游戏按隐藏,
-声音静了、画面还在屏幕上。原因:独占全屏的游戏由 D3D/DXGI 直接把画面翻转
-输出到显示器,`WS_VISIBLE` 与最终画面是两条路 —— 把窗口 `SW_HIDE` 掉,
-窗口"看不见了",游戏却照旧渲染。
-*修复:全屏窗口(无标题栏 + 铺满所在显示器)可以走 **先最小化、再隐藏**:
-`WM_SYSCOMMAND/SC_MINIMIZE` *+* `ShowWindowAsync(SW_MINIMIZE)`,等它掉出
-独占全屏后再 `SW_HIDE`。判据改成 `is_offscreen`(隐藏**或**最小化),
-否则全屏游戏最小化后 `IsWindowVisible` 仍是 True,会被误记成"失败"。*
-*判定必须排除三类"铺满屏幕但不是游戏"的窗口,否则会误走最小化路径:
-带 `WS_CAPTION` 的最大化窗口、`WS_EX_NOACTIVATE/LAYERED/NOREDIRECTIONBITMAP`
-的覆盖层(实测有 `Windows 输入体验`、`NVIDIA GeForce Overlay`)、
-`WS_DISABLED` 的桌面 `Progman`。附带:桌面/任务栏窗口不再出现在列表里
-(`win32.is_shell_window`),断了"一键把桌面藏了"的第二次机会。*
-*另外隐藏失败现在会**说出来**(托盘气泡 + 状态栏 + 日志),以前是静默
-假装成功 —— 静默失败比失败本身更坑。*
-
-**但这招有代价,所以默认关掉** 实测永劫无间:最小化之后它主线程再也不处理
-消息(`IsHungAppWindow` 为真),此后 `ShowWindowAsync` 的请求永远堆在无人
-处理的队列里 —— **游戏自己回不来**,窗口又是 `WS_POPUP`、没有任务栏按钮、
-不在 Alt+Tab 里,用户没有任何入口点回去。所以:
-
-- 默认只做安全的那一半(`SW_HIDE` + 工具窗样式),藏不住就报"没藏掉";
-- 设置里勾「强制隐藏独占全屏游戏」才走最小化路径,并明确标注风险;
-- 走最小化路径时若"最小化成功、隐藏失败",立刻 `_undo_hide` 撤回原样,
-  绝不留半残状态。
-
-**目标无响应时,任何窗口操作都可能把调用方一起卡死** 现象:隐藏一个卡死的
-全屏游戏,工具界面直接变成"未响应",只能强杀进程。根因是主线程上做了跨进程
-**同步**窗口调用(`SetWindowLongPtr` / `SetWindowPlacement` / 同步
-`SetWindowPos` 都要等目标线程处理),目标不处理就永远等下去。
-*三道护栏:① **隐藏/恢复全部放工作线程**,主线程只发信号、画界面;② 动手前
-用 `IsHungAppWindow`(Windows 自己的"未响应"判定)检查,发现 hung 就**完全
-不碰**并说明原因;③ 能异步的一律异步 —— `ShowWindowAsync`、
-`SetWindowPos(... | SWP_ASYNCWINDOWPOS)` 投递到对方队列就返回。*
-*顺带发现:`WM_NULL` + `SendMessageTimeout` **不能**用来判断目标是否响应
-(不对消息循环的窗口照样返回成功),必须用 `IsHungAppWindow`。*
-
-**托盘图标为什么能删掉?** 托盘图标由 `Shell_NotifyIcon(NIM_DELETE)` 删除,
-该 API 内部向 explorer 的托盘工具栏发消息,不校验发送方进程,因此可以跨进程删除。
-uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreated` 消息,
-应用会按微软文档推荐的做法重新注册自己的图标。
-*已知限制:以 GUID 方式注册图标的程序(部分新版 Electron/国产软件)无法从外部
-获知 GUID,其托盘图标会保留,但窗口本身照样隐藏。*
-
-**静音** 用的是系统音量合成器同一套接口(Core Audio `ISimpleAudioVolume`),
-纯 ctypes 实现,只影响目标程序的音频会话。
-*踩坑记录:`CLSID_MMDeviceEnumerator` 是 `{BCDE0395-E52F-467C-8E3D-C4579291692E}`,
-第三段是 **467C**(见 `mmdeviceapi.h`),误记成 467E 会让 `CoCreateInstance`
-返回 `REGDB_E_CLASSNOTREG`;另外 `IAudioSessionManager2::GetSessionEnumerator`
-在 vtable 索引 5(前面有两个方法),`IAudioSessionControl2::GetProcessId`
-在索引 14(前面有 11 个方法)。*
-
-**浏览器静不了音?因为音频不在主进程放** 现象:浏览器能隐藏但静不了音,
-游戏却能静。原因:Chromium 系(Edge/Chrome)的声音由 **audio service 子进程**
-播放(实测 Edge 主 pid 零会话,2 个会话全在子进程上),按主窗口 pid 找会话
-当然静不了;游戏是主进程直接放音频,所以旧逻辑对游戏有效。
-*修复:`set_process_mute` / `is_process_muted` 的目标从单个 pid 扩展为
-**pid + 全部子孙进程**(`win32.process_descendants`,toolhelp 快照建父子表
-再 BFS)。用进程树而非进程名匹配,不会误伤同名的其它浏览器实例。
-回归测试 `audio_tree_test.py` 用"父进程无会话、子进程播音"确定性复现。*
-
-**窗口枚举必须防挂起** `GetWindowTextW` / `WM_GETICON` 都是跨线程
-`SendMessage`,遇到"无响应"进程的窗口会**无限期阻塞调用方** —— 曾导致
-点击隐藏后整个工具卡死(栈停在 `get_window_text`)。现在统一改用
-`SendMessageTimeoutW`(`SMTO_ABORTIFHUNG`,100ms 超时),挂起窗口的标题
-降级为空串,不影响其它窗口;枚举时也先按 pid 过滤再取详情,
-避免对全系统窗口逐个发消息。
-
-**热键** 独立线程建消息窗口 + `RegisterHotKey`,`MOD_NOREPEAT` 防连发;收到 `WM_HOTKEY` 后通过 Qt 信号转主线程执行,响应延迟在毫秒级。
-*踩坑记录(实测"改设置后快捷键没反应"):窗口类名必须按线程唯一化 ——
-同进程内第二次 `RegisterClassW` 同名类必然失败,旧线程还没退出完时新线程
-起不来,旧热键已注销、新热键没注册,热键整个静默死掉。现在类名带线程序号,
-且线程起不来/注册失败必须写日志 + 发信号(托盘气泡提示),绝不允许静默;
-`RegisterHotKey` 另带 6 次重试兜底旧线程退出超时的竞态。*
-
-**隐藏状态持久化** 隐藏记录(pid + hwnd + 原样式)落在
-`%APPDATA%\WindowHide\hidden_state.json`,每次变更即写盘;启动时逐条校验
-(进程存活 / IsWindow / pid 匹配 / 当前不可见 / 带 TOOLWINDOW 样式),
-不合格的丢弃。否则工具重启后"还藏着的窗口"会变成孤儿 —— 界面不显示、
-热键恢复找不到目标,只能手动重启目标程序。
-
-**`GetForegroundWindow` 在托盘菜单场景是个陷阱** 现象:从托盘菜单点
-"隐藏当前前台窗口",一键把**桌面、任务栏连同所有资源管理器窗口**全藏了。
-原因:菜单弹出的瞬间前台窗口变成 explorer 的 Progman / Shell_TrayWnd,
-按 pid 藏进程 = 藏整个 explorer。同理,在主界面点按钮时前台是工具自己,
-会把自个儿藏掉。*结论:"隐藏当前前台窗口"这个交互从托盘/主界面/快捷键
-全部撤掉,改为用户真正想要的「隐藏本工具(收进托盘)」;core 的
-`hide_foreground` 保留但加了桌面/任务栏/自身三重保护备用。*
-
-**目标程序以管理员权限运行时,我们能做的极其有限(UIPI)** 现象:永劫无间
-(全屏,管理员权限运行)点隐藏后"只最小化到桌面、还点不回来"。
-排查结论:`OpenProcess(PROCESS_VM_READ)` 对它返回 **错误 5**,
-而工具自身是普通权限 —— UIPI 把 `SetWindowLongPtrW`(加 TOOLWINDOW)、
-`SetWindowPlacement`、`SetForegroundWindow` **全部静默拦掉**,只有
-`ShowWindowAsync(SW_MINIMIZE)` 生效。更糟的是游戏窗口是 `WS_POPUP` 且没有
-`WS_EX_APPWINDOW`:最小化之后**没有任务栏按钮、也不在 Alt+Tab 里**,
-用户根本没有入口点回去。
-*修复三层:*
-*① **动手前先问权限**(`win32.process_is_higher_integrity`,用
-`PROCESS_VM_READ` 能不能拿到判断)—— 权限不够就**完全不碰**,弹气泡说明
-"请以管理员身份重启";*
-*② **全有或全无**:全屏窗口"最小化成功、隐藏失败"时必须**回滚**
-(`_undo_hide` 拉回原位),绝不能把窗口丢在"最小化且点不回来"的死角;*
-*③ 托盘菜单加「**以管理员身份重启**」(`ShellExecuteW runas`,新进程带
-`--elevated` 跳过单实例检查,旧进程 `os._exit` 直接退出以让出互斥体)。*
-*恢复路径也一起加固:`SetWindowPlacement` 直接改窗口状态(游戏对
-`ShowWindow(SW_SHOWNORMAL)` 可能完全没反应),抢前台改用
-`AttachThreadInput` 那条路,且全程只用异步 API —— 同步 `ShowWindow`
-跨进程要等目标线程,游戏主循环一卡就把工具的 UI 冻住。*
-
-**场景是什么、为什么这么设计** 单纯"记住一批窗口"解决不了真问题:换场合时
-用户要的是**切换**,不是重新勾一遍。所以场景的定义是"藏这批 + 放掉别的场景藏的
-那批",而**手动勾选藏的窗口永远不动** —— 那是用户自己的临时决定,不该被场景
-覆盖。切换语义写死在这三条规则里,没有隐藏开关。
-
-## 配置文件
-
-`%APPDATA%\WindowHide\config.json`,格式版本 **v2**:
-
-```jsonc
-{
-  "version": 2,
-  "active_profile": "上班",
-  "profiles": [
-    {"name": "上班", "mute": true,
-     "rules": [{"process": "Steam.exe", "window_class": "", "title_regex": "", "label": "Steam"}]},
-    {"name": "游戏", "mute": false, "rules": []}
-  ],
-  "protected_processes": ["某监控客户端.exe"]   // 永不隐藏的自定义补充
-}
-```
-
-v1(平铺 `targets`)的旧配置启动时**自动升级**,原文件备份成
-`config.v1.bak.json` —— 升级失败也不会把你手写的配置弄丢。
-
-## 急救:窗口卡在"最小化、点不回来"
-
-`tools/rescue_window.bat` 双击即可(会自己弹 UAC 提权),自动找到
-游戏进程 → `SetWindowPlacement` 拉回 → `SC_RESTORE` → 抢前台 → 取消静音。
-适用于本工具(或任何同类工具)把全屏游戏最小化后没恢复的场景。
-
-## 测试
+### 测试
 
 分两类。**需要真实 Windows 桌面会话的**(隐藏/恢复/静音/热键注入/全屏)在
 CI 里跑不了 —— headless runner 没有交互式桌面,硬塞进去只会常年红灯 ——
@@ -356,6 +261,13 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 产品侧对应加固:恢复时取消静音带重试(会话可能被系统临时回收),
 否则用户恢复窗口后应用会一直静着。
 
+### 更多
+
+技术细节(为什么任务栏会消失、全屏游戏为什么藏不掉、无响应目标怎么防卡死、
+UIPI 权限、托盘图标怎么删)都在 **[docs/DESIGN.md](docs/DESIGN.md)**。
+优化路线见 [docs/ROADMAP.md](docs/ROADMAP.md),需要真人配合的测试清单见
+[docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)。
+
 ## 常见问题
 
 - **隐藏没反应/部分窗口失败?** 工具会弹气泡告诉你是哪几个窗口没藏掉。
@@ -372,12 +284,14 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 - **窗口卡在最小化、任务栏也找不到?** 先双击 `tools/rescue_window.bat`
   (会弹 UAC 提权);若脚本提示 `hung=True`,说明目标主线程已经不理消息,
   外部手段进不去 —— 只能任务管理器结束那个进程重开。
+- **每次关窗口都弹一下「已最小化到托盘」,烦?** 设置 →「行为」→ 取消
+  「关闭主界面时提示「已最小化到托盘」」。想彻底安静,再把上面那条
+  「隐藏 / 恢复时弹出托盘气泡提示」也取消。
 - **快捷键没反应?** 组合键可能被其它软件占用,在设置里换一个组合。
 - **恢复后托盘图标没回来?** 少数程序不处理 `TaskbarCreated` 消息,手动重启
   该程序即可,不影响窗口隐藏/恢复本身。
 - **想开机自启?** 设置 → 行为 → 勾选"开机自动启动"(写当前用户注册表 Run 项,
   不需要管理员)。
-
 ## 开发状态与参与
 
 - 优化路线(含实测数据与验收标准):[`docs/ROADMAP.md`](docs/ROADMAP.md)
@@ -386,7 +300,6 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 
 欢迎按测试清单里的步骤回报结果。**报问题时请附** `%APPDATA%\WindowHide\windowhide.log`
 的最后几十行 + 程序名 + 工具当时是否以管理员身份运行 —— 这三样基本就能定位。
-
 ## 边界与免责
 
 这是一个**本机窗口管理工具**,只做三件事:改目标窗口的显示状态、按进程移除
@@ -398,7 +311,6 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 - 请只在**自己有权操作的设备**上使用。拿它偷窥、规避监护或规避审计不在
   支持范围内,也不被作者认可。
 - 隐藏不等于隐身:目标程序仍在运行,任务管理器、资源监视器照样看得见。
-
 ## 许可证
 
 [MIT](LICENSE)

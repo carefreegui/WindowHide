@@ -12,6 +12,7 @@ from . import APP_DISPLAY_NAME
 from .config import Config
 from .core.hide import HideController
 from .core.hotkeys import HotkeyManager
+from .ui.icon import load_icon
 from .ui.main_window import SHOW_ME_MSG, MainWindow
 from .ui.tray import SystemTray
 
@@ -69,12 +70,29 @@ def _install_excepthook() -> None:
     threading.excepthook = _thread_hook
 
 
+def _set_app_user_model_id() -> None:
+    """给进程一个显式的 AppUserModelID。
+
+    不设的话,托盘气泡的标题栏会显示解释器名字("Python"),因为 Windows
+    用进程可执行文件名当"应用身份"。打包成 exe 后会是 WindowHide.exe,
+    但开发态跑 run.pyw 时就是 Python —— 设一下两者都干净。
+    """
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "WindowHide.Desktop")
+    except Exception:
+        pass
+
+
 def main() -> int:
     _install_excepthook()
     _fix_qt_locale()
+    _set_app_user_model_id()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(APP_DISPLAY_NAME)
+    # 所有窗口(主界面、设置、对话框)和任务栏按钮都用同一个图标
+    app.setWindowIcon(load_icon())
 
     if _already_running() and "--elevated" not in sys.argv:
         # --elevated 是"以管理员身份重启"带过来的:此刻旧实例正在退出,

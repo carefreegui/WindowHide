@@ -1,40 +1,59 @@
 """window_list.py - 窗口列表表格。"""
 from __future__ import annotations
 
-import ctypes
-from ctypes import wintypes
+from functools import lru_cache
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 
+from ..core import win32
 from ..core.classify import type_label, type_color
-from ..core.win32 import (
-    WindowInfo, WM_GETICON, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
-    SEND_MSG_TIMEOUT_MS,
-)
+from ..core.win32 import WindowInfo
 
 COL_CHECK, COL_APP, COL_TITLE, COL_TYPE, COL_STATUS, COL_PID = range(6)
 
 _STATE_LABELS = {True: "已隐藏", False: "显示中"}
 
 
-def _get_icon_handle(hwnd: int, size: int) -> int:
-    """带超时地取窗口图标句柄(WM_GETICON 也是跨线程发送,会阻塞)。"""
-    result = wintypes.ULONG(0)
-    return int(SendMessageTimeoutW(hwnd, WM_GETICON, size, 0,
-                                   SMTO_ABORTIFHUNG, SEND_MSG_TIMEOUT_MS,
-                                   ctypes.byref(result)) or 0)
+@lru_cache(maxsize=512)
+def _icon_by_exe(path: str) -> QIcon | None:
+    """按 exe 取系统文件图标(最后一道兜底,几乎所有程序都有)。"""
+    hicon = win32.file_icon_handle(path, big=True)
+    if not hicon:
+        return None
+    try:
+        image = QImage.fromHICON(int(hicon))
+        return None if image.isNull() else QIcon(QPixmap.fromImage(image))
+    finally:
+        # 文件图标的句柄归调用方,不还就是每次刷新泄漏一个 GDI 对象
+        win32.DestroyIcon(hicon)
+
+
+@lru_cache(maxsize=512)
+def _icon_by_hwnd(hwnd: int) -> QIcon | None:
+    hicon = win32.window_icon_handle(hwnd, big=True)
+    if not hicon:
+        return None
+    image = QImage.fromHICON(int(hicon))
+    return None if image.isNull() else QIcon(QPixmap.fromImage(image))
 
 
 def _icon_for_window(win: WindowInfo) -> QIcon | None:
-    """尽量取窗口自身的图标;取不到就用类型色块。"""
+    """尽量取窗口自身的图标;取不到就用 exe 的文件图标,再不行用类型色块。
+
+    两级兜底是必要的:Chromium 系只设 `WM_GETICON`,老 Win32 程序只在窗口类
+    上挂图标,还有些(控制台/UWP 宿主)两样都没有,只能问 shell 要文件图标。
+    都取不到才画色块。
+    """
+    if win.hung:
+        return None      # 无响应的窗口问一次要等 100ms,不值得
     try:
-        hicon = _get_icon_handle(win.hwnd, 1) or _get_icon_handle(win.hwnd, 0)
-        if hicon:
-            pix = QPixmap.fromWinHICON(hicon)
-            if not pix.isNull():
-                return QIcon(pix)
+        icon = _icon_by_hwnd(win.hwnd)
+        if icon is not None:
+            return icon
+        if win.process_path:
+            return _icon_by_exe(win.process_path)
     except Exception:
         pass
     return None

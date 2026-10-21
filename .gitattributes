@@ -16,3 +16,6 @@
 *.png binary
 *.ico binary
 *.jpg binary
+
+# 图标
+*.ico binary

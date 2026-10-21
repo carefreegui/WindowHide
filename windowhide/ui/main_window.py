@@ -195,17 +195,46 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 动作
     def _current_targets(self) -> list[int]:
+        """当前该被"切换"的窗口:勾选/选中优先,否则用已保存的场景规则。
+
+        规则解析必须能容忍**快照过期**:恢复是异步的,刷新恰好赶在"窗口已经
+        不隐藏、但还没重新显示"的那一瞬,这个窗口会既不在可见列表、也不在
+        隐藏集合里,于是被刷出 `self._windows` —— 这时同一次点击就会变成
+        "没目标,什么都不做"(用户体感:"点了没反应")。所以解析不到就重新
+        枚举一次(18ms,只在没目标时发生)。
+        """
         checked = self._table.checked_hwnds()
         if checked:
             return checked
         selected = self._table.selected_hwnds()
         if selected:
             return selected
-        # 没有勾选/选中:用已保存的规则(含被本工具隐藏的窗口)
+        hwnds = self._resolve_rules(self._windows)
+        if hwnds:
+            return hwnds
+        try:
+            fresh = win32.enum_top_level_windows()
+        except Exception:
+            return []
+        return self._resolve_rules(fresh)
+
+    def _resolve_rules(self, windows) -> list[int]:
+        """按已保存的规则挑窗口(含"已隐藏/正在切换"的)。"""
         matched = resolve_target_hwnds(
-            self._config.targets, self._windows,
+            self._config.targets, windows,
             include_hidden=self._controller.hidden_hwnds())
-        return [w.hwnd for w in matched]
+        out = [w.hwnd for w in matched]
+        # 正在隐藏途中(还没写进隐藏记录)的窗口也要算进来,否则连点第二下
+        # 会被判成"还没藏"从而又藏一次。只收命中规则的,别把用户手动藏的
+        # 窗口卷进来。
+        for w in windows:
+            if w.hwnd in out:
+                continue
+            if not self._controller.is_pid_hidden_or_pending(w.pid):
+                continue
+            if any(rule.matches(w) for rule in self._config.targets):
+                out.append(w.hwnd)
+        return out
 
     def _hide_checked(self) -> None:
         hwnds = self._table.checked_hwnds() or self._table.selected_hwnds()
@@ -479,7 +508,11 @@ class MainWindow(QMainWindow):
         if self._config.minimize_to_tray:
             event.ignore()
             self.hide()
-            self._tray.showMessage("窗口隐藏工具", "已最小化到托盘,点击图标可切换隐藏状态")
+            # 这条提示曾经是无条件的 —— 用户每次关窗口都被弹一下。
+            # 现在有自己的开关:很多人只想关掉这一条,还想留着隐藏/恢复的确认。
+            if self._config.show_minimize_hint:
+                self._tray.showMessage(
+                    "窗口隐藏工具", "已最小化到托盘,点击图标可切换隐藏状态")
         else:
             self._quit()
             event.accept()

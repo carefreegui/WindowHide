@@ -112,6 +112,8 @@ class SettingsDialog(QDialog):
         self._cb_activate = QCheckBox("恢复时把主窗口带到前台")
         self._cb_tray = QCheckBox("关闭主界面时最小化到系统托盘(不退出)")
         self._cb_balloon = QCheckBox("隐藏 / 恢复时弹出托盘气泡提示")
+        self._cb_min_hint = QCheckBox(
+            "关闭主界面时提示「已最小化到托盘」(不喜欢被打扰可以关掉)")
         self._cb_autostart = QCheckBox("开机自动启动(写入当前用户注册表 Run 项)")
         self._cb_auto_rules = QCheckBox(
             "规则持续生效:目标程序重启后,按当前场景自动再隐藏一次")
@@ -123,6 +125,7 @@ class SettingsDialog(QDialog):
         self._cb_activate.setChecked(self._config.activate_on_restore)
         self._cb_tray.setChecked(self._config.minimize_to_tray)
         self._cb_balloon.setChecked(self._config.show_balloon)
+        self._cb_min_hint.setChecked(self._config.show_minimize_hint)
         self._cb_autostart.setChecked(self._config.autostart)
         self._cb_auto_rules.setChecked(self._config.auto_apply_rules)
         self._cb_force_fs.setChecked(self._config.force_fullscreen_hide)
@@ -136,8 +139,11 @@ class SettingsDialog(QDialog):
             "「没藏掉」,不会去动它。")
 
         for cb in (self._cb_mute, self._cb_keep, self._cb_activate,
-                   self._cb_tray, self._cb_balloon, self._cb_autostart,
                    self._cb_auto_rules):
+            v.addWidget(cb)
+        for cb in (self._cb_tray, self._cb_balloon, self._cb_min_hint):
+            v.addWidget(cb)
+        for cb in (self._cb_autostart,):
             v.addWidget(cb)
         v.addWidget(self._cb_force_fs)
 
@@ -292,6 +298,7 @@ class SettingsDialog(QDialog):
         config.activate_on_restore = self._cb_activate.isChecked()
         config.minimize_to_tray = self._cb_tray.isChecked()
         config.show_balloon = self._cb_balloon.isChecked()
+        config.show_minimize_hint = self._cb_min_hint.isChecked()
         config.autostart = self._cb_autostart.isChecked()
         config.auto_apply_rules = self._cb_auto_rules.isChecked()
         config.force_fullscreen_hide = self._cb_force_fs.isChecked()

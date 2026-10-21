@@ -159,6 +159,14 @@ GetWindowLongPtrW = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWind
 GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
 GetWindowLongPtrW.restype = ctypes.c_ssize_t
 
+GetClassLongPtrW = getattr(user32, "GetClassLongPtrW", None) or user32.GetClassLongW
+GetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+GetClassLongPtrW.restype = ctypes.c_ssize_t
+
+DestroyIcon = user32.DestroyIcon
+DestroyIcon.argtypes = [wintypes.HICON]
+DestroyIcon.restype = wintypes.BOOL
+
 SetWindowLongPtrW = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
 SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
 SetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -942,3 +950,56 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
 
 def is_hidden(hwnd: int) -> bool:
     return not IsWindowVisible(hwnd)
+
+
+# ---------------------------------------------------------------- 图标
+SHGFI_ICON = 0x00000100
+SHGFI_LARGEICON = 0x00000000
+SHGFI_SMALLICON = 0x00000001
+SHGFI_USEFILEATTRIBUTES = 0x00000010
+
+
+class SHFILEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", wintypes.HICON),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", wintypes.DWORD),
+        ("szDisplayName", wintypes.WCHAR * 260),
+        ("szTypeName", wintypes.WCHAR * 80),
+    ]
+
+
+SHGetFileInfoW = shell32.SHGetFileInfoW
+SHGetFileInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                           ctypes.POINTER(SHFILEINFOW), wintypes.UINT,
+                           wintypes.UINT]
+SHGetFileInfoW.restype = ctypes.c_size_t
+
+
+def window_icon_handle(hwnd: int, big: bool = True) -> int:
+    """取窗口自己的图标句柄(0 = 没有)。返回的句柄**不属于调用方**,不要销毁。
+
+    两条路都要走:Chromium/Electron 系只设 `WM_GETICON`,传统 Win32 程序
+    多数只在**窗口类**上挂图标(`GCLP_HICON`)。只查前者会几乎全空 ——
+    列表里就只剩一片灰色色块(用户反馈"看起来太素"就是这个)。
+    """
+    if not IsWindow(hwnd) or is_hung(hwnd):
+        return 0
+    r = wintypes.ULONG(0)
+    for kind in ((1, 0) if big else (0, 2)):   # ICON_BIG / ICON_SMALL(,SMALL2)
+        n = SendMessageTimeoutW(hwnd, WM_GETICON, kind, 0, SMTO_ABORTIFHUNG,
+                                SEND_MSG_TIMEOUT_MS, ctypes.byref(r))
+        if n > 0 and r.value:
+            return int(r.value)
+    h = GetClassLongPtrW(hwnd, GCLP_HICON if big else GCLP_HICONSM)
+    return int(h or 0)
+
+
+def file_icon_handle(path: str, big: bool = True) -> int:
+    """按 exe 路径取系统文件图标。返回的句柄**归调用方**,用完要 DestroyIcon。"""
+    if not path:
+        return 0
+    info = SHFILEINFOW()
+    flags = SHGFI_ICON | (SHGFI_LARGEICON if big else SHGFI_SMALLICON)
+    ok = SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), flags)
+    return int(info.hIcon) if ok else 0

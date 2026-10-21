@@ -234,9 +234,16 @@ def main() -> int:
     time.sleep(0.3)
     USER32.PostMessageW(gui_hwnd, 0x0010, 0, 0)   # WM_CLOSE GUI(进托盘)
     time.sleep(0.5)
-    gui.terminate()   # 结束 wrapper;真身可能残留,交给系统回收
+    gui.terminate()   # 结束 wrapper;真身可能残留,下面按窗口 pid 再补一刀
     if find_dummy():
         dummy.kill()
+    # 真身可能不是 gui 这个 launcher(取决于解释器是不是中转进程):
+    # 残留实例会**一直占着全局热键**,后面所有热键测试都会莫名失败。
+    # 所以按窗口句柄找到真正持有窗口的 pid,直接结束。
+    app_pid = win32.get_window_pid(gui_hwnd) if gui_hwnd else 0
+    if app_pid and win32.process_is_alive(app_pid):
+        subprocess.run(["taskkill", "/PID", str(app_pid), "/F"],
+                       capture_output=True)
     restore_config(config_backup)
 
     ok = registered and hidden and alive and visible

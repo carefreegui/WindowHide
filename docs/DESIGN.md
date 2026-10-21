@@ -1,0 +1,195 @@
+# 设计笔记:为什么这么写
+
+> 这一篇是 WindowHide 的「踩坑与取舍」记录。结论全部在真机上验证过 ——
+> 很多条背后是一次事故(界面卡死、游戏回不来、配置被测试覆盖)。
+> 要改相关代码之前,建议先读对应那一段。
+
+## 目录
+
+1. [隐藏为什么任务栏会消失?](#s1)
+2. [全屏游戏藏不掉?独占全屏根本不看窗口可见性](#s2)
+3. [但这招有代价,所以默认关掉](#s3)
+4. [目标无响应时,任何窗口操作都可能把调用方一起卡死](#s4)
+5. [托盘图标为什么能删掉?](#s5)
+6. [静音](#s6)
+7. [浏览器静不了音?因为音频不在主进程放](#s7)
+8. [窗口枚举必须防挂起](#s8)
+9. [热键](#s9)
+10. [隐藏状态持久化](#s10)
+11. [`GetForegroundWindow` 在托盘菜单场景是个陷阱](#s11)
+12. [目标程序以管理员权限运行时,我们能做的极其有限(UIPI)](#s12)
+13. [场景是什么、为什么这么设计](#s13)
+
+---
+
+<a id="s1"></a>
+
+## 隐藏为什么任务栏会消失?
+
+两个动作叠加:`ShowWindow(SW_HIDE)` 让窗口不可见,
+再给窗口加 `WS_EX_TOOLWINDOW` 扩展样式——带该样式的顶层窗口不出现在任务栏和
+Alt+Tab 中。恢复时两者都会还原。即使目标程序自己调 `ShowWindow(SW_SHOW)`,
+工具窗口样式也能保证它不会回到任务栏(看门狗每秒复查,可关)。
+
+<a id="s2"></a>
+
+## 全屏游戏藏不掉?独占全屏根本不看窗口可见性
+
+全屏游戏按隐藏,
+声音静了、画面还在屏幕上。原因:独占全屏的游戏由 D3D/DXGI 直接把画面翻转
+输出到显示器,`WS_VISIBLE` 与最终画面是两条路 —— 把窗口 `SW_HIDE` 掉,
+窗口"看不见了",游戏却照旧渲染。
+*修复:全屏窗口(无标题栏 + 铺满所在显示器)可以走 **先最小化、再隐藏**:
+`WM_SYSCOMMAND/SC_MINIMIZE` *+* `ShowWindowAsync(SW_MINIMIZE)`,等它掉出
+独占全屏后再 `SW_HIDE`。判据改成 `is_offscreen`(隐藏**或**最小化),
+否则全屏游戏最小化后 `IsWindowVisible` 仍是 True,会被误记成"失败"。*
+*判定必须排除三类"铺满屏幕但不是游戏"的窗口,否则会误走最小化路径:
+带 `WS_CAPTION` 的最大化窗口、`WS_EX_NOACTIVATE/LAYERED/NOREDIRECTIONBITMAP`
+的覆盖层(实测有 `Windows 输入体验`、`NVIDIA GeForce Overlay`)、
+`WS_DISABLED` 的桌面 `Progman`。附带:桌面/任务栏窗口不再出现在列表里
+(`win32.is_shell_window`),断了"一键把桌面藏了"的第二次机会。*
+*另外隐藏失败现在会**说出来**(托盘气泡 + 状态栏 + 日志),以前是静默
+假装成功 —— 静默失败比失败本身更坑。*
+
+<a id="s3"></a>
+
+## 但这招有代价,所以默认关掉
+
+实测永劫无间:最小化之后它主线程再也不处理
+消息(`IsHungAppWindow` 为真),此后 `ShowWindowAsync` 的请求永远堆在无人
+处理的队列里 —— **游戏自己回不来**,窗口又是 `WS_POPUP`、没有任务栏按钮、
+不在 Alt+Tab 里,用户没有任何入口点回去。所以:
+
+- 默认只做安全的那一半(`SW_HIDE` + 工具窗样式),藏不住就报"没藏掉";
+- 设置里勾「强制隐藏独占全屏游戏」才走最小化路径,并明确标注风险;
+- 走最小化路径时若"最小化成功、隐藏失败",立刻 `_undo_hide` 撤回原样,
+  绝不留半残状态。
+
+<a id="s4"></a>
+
+## 目标无响应时,任何窗口操作都可能把调用方一起卡死
+
+现象:隐藏一个卡死的
+全屏游戏,工具界面直接变成"未响应",只能强杀进程。根因是主线程上做了跨进程
+**同步**窗口调用(`SetWindowLongPtr` / `SetWindowPlacement` / 同步
+`SetWindowPos` 都要等目标线程处理),目标不处理就永远等下去。
+*三道护栏:① **隐藏/恢复全部放工作线程**,主线程只发信号、画界面;② 动手前
+用 `IsHungAppWindow`(Windows 自己的"未响应"判定)检查,发现 hung 就**完全
+不碰**并说明原因;③ 能异步的一律异步 —— `ShowWindowAsync`、
+`SetWindowPos(... | SWP_ASYNCWINDOWPOS)` 投递到对方队列就返回。*
+*顺带发现:`WM_NULL` + `SendMessageTimeout` **不能**用来判断目标是否响应
+(不对消息循环的窗口照样返回成功),必须用 `IsHungAppWindow`。*
+
+<a id="s5"></a>
+
+## 托盘图标为什么能删掉?
+
+托盘图标由 `Shell_NotifyIcon(NIM_DELETE)` 删除,
+该 API 内部向 explorer 的托盘工具栏发消息,不校验发送方进程,因此可以跨进程删除。
+uID 未知时遍历 0..64 试探。恢复时向目标进程广播 `TaskbarCreated` 消息,
+应用会按微软文档推荐的做法重新注册自己的图标。
+*已知限制:以 GUID 方式注册图标的程序(部分新版 Electron/国产软件)无法从外部
+获知 GUID,其托盘图标会保留,但窗口本身照样隐藏。*
+
+<a id="s6"></a>
+
+## 静音
+
+用的是系统音量合成器同一套接口(Core Audio `ISimpleAudioVolume`),
+纯 ctypes 实现,只影响目标程序的音频会话。
+*踩坑记录:`CLSID_MMDeviceEnumerator` 是 `{BCDE0395-E52F-467C-8E3D-C4579291692E}`,
+第三段是 **467C**(见 `mmdeviceapi.h`),误记成 467E 会让 `CoCreateInstance`
+返回 `REGDB_E_CLASSNOTREG`;另外 `IAudioSessionManager2::GetSessionEnumerator`
+在 vtable 索引 5(前面有两个方法),`IAudioSessionControl2::GetProcessId`
+在索引 14(前面有 11 个方法)。*
+
+<a id="s7"></a>
+
+## 浏览器静不了音?因为音频不在主进程放
+
+现象:浏览器能隐藏但静不了音,
+游戏却能静。原因:Chromium 系(Edge/Chrome)的声音由 **audio service 子进程**
+播放(实测 Edge 主 pid 零会话,2 个会话全在子进程上),按主窗口 pid 找会话
+当然静不了;游戏是主进程直接放音频,所以旧逻辑对游戏有效。
+*修复:`set_process_mute` / `is_process_muted` 的目标从单个 pid 扩展为
+**pid + 全部子孙进程**(`win32.process_descendants`,toolhelp 快照建父子表
+再 BFS)。用进程树而非进程名匹配,不会误伤同名的其它浏览器实例。
+回归测试 `audio_tree_test.py` 用"父进程无会话、子进程播音"确定性复现。*
+
+<a id="s8"></a>
+
+## 窗口枚举必须防挂起
+
+`GetWindowTextW` / `WM_GETICON` 都是跨线程
+`SendMessage`,遇到"无响应"进程的窗口会**无限期阻塞调用方** —— 曾导致
+点击隐藏后整个工具卡死(栈停在 `get_window_text`)。现在统一改用
+`SendMessageTimeoutW`(`SMTO_ABORTIFHUNG`,100ms 超时),挂起窗口的标题
+降级为空串,不影响其它窗口;枚举时也先按 pid 过滤再取详情,
+避免对全系统窗口逐个发消息。
+
+<a id="s9"></a>
+
+## 热键
+
+独立线程建消息窗口 + `RegisterHotKey`,`MOD_NOREPEAT` 防连发;收到 `WM_HOTKEY` 后通过 Qt 信号转主线程执行,响应延迟在毫秒级。
+*踩坑记录(实测"改设置后快捷键没反应"):窗口类名必须按线程唯一化 ——
+同进程内第二次 `RegisterClassW` 同名类必然失败,旧线程还没退出完时新线程
+起不来,旧热键已注销、新热键没注册,热键整个静默死掉。现在类名带线程序号,
+且线程起不来/注册失败必须写日志 + 发信号(托盘气泡提示),绝不允许静默;
+`RegisterHotKey` 另带 6 次重试兜底旧线程退出超时的竞态。*
+
+<a id="s10"></a>
+
+## 隐藏状态持久化
+
+隐藏记录(pid + hwnd + 原样式)落在
+`%APPDATA%\WindowHide\hidden_state.json`,每次变更即写盘;启动时逐条校验
+(进程存活 / IsWindow / pid 匹配 / 当前不可见 / 带 TOOLWINDOW 样式),
+不合格的丢弃。否则工具重启后"还藏着的窗口"会变成孤儿 —— 界面不显示、
+热键恢复找不到目标,只能手动重启目标程序。
+
+<a id="s11"></a>
+
+## `GetForegroundWindow` 在托盘菜单场景是个陷阱
+
+现象:从托盘菜单点
+"隐藏当前前台窗口",一键把**桌面、任务栏连同所有资源管理器窗口**全藏了。
+原因:菜单弹出的瞬间前台窗口变成 explorer 的 Progman / Shell_TrayWnd,
+按 pid 藏进程 = 藏整个 explorer。同理,在主界面点按钮时前台是工具自己,
+会把自个儿藏掉。*结论:"隐藏当前前台窗口"这个交互从托盘/主界面/快捷键
+全部撤掉,改为用户真正想要的「隐藏本工具(收进托盘)」;core 的
+`hide_foreground` 保留但加了桌面/任务栏/自身三重保护备用。*
+
+<a id="s12"></a>
+
+## 目标程序以管理员权限运行时,我们能做的极其有限(UIPI)
+
+现象:永劫无间
+(全屏,管理员权限运行)点隐藏后"只最小化到桌面、还点不回来"。
+排查结论:`OpenProcess(PROCESS_VM_READ)` 对它返回 **错误 5**,
+而工具自身是普通权限 —— UIPI 把 `SetWindowLongPtrW`(加 TOOLWINDOW)、
+`SetWindowPlacement`、`SetForegroundWindow` **全部静默拦掉**,只有
+`ShowWindowAsync(SW_MINIMIZE)` 生效。更糟的是游戏窗口是 `WS_POPUP` 且没有
+`WS_EX_APPWINDOW`:最小化之后**没有任务栏按钮、也不在 Alt+Tab 里**,
+用户根本没有入口点回去。
+*修复三层:*
+*① **动手前先问权限**(`win32.process_is_higher_integrity`,用
+`PROCESS_VM_READ` 能不能拿到判断)—— 权限不够就**完全不碰**,弹气泡说明
+"请以管理员身份重启";*
+*② **全有或全无**:全屏窗口"最小化成功、隐藏失败"时必须**回滚**
+(`_undo_hide` 拉回原位),绝不能把窗口丢在"最小化且点不回来"的死角;*
+*③ 托盘菜单加「**以管理员身份重启**」(`ShellExecuteW runas`,新进程带
+`--elevated` 跳过单实例检查,旧进程 `os._exit` 直接退出以让出互斥体)。*
+*恢复路径也一起加固:`SetWindowPlacement` 直接改窗口状态(游戏对
+`ShowWindow(SW_SHOWNORMAL)` 可能完全没反应),抢前台改用
+`AttachThreadInput` 那条路,且全程只用异步 API —— 同步 `ShowWindow`
+跨进程要等目标线程,游戏主循环一卡就把工具的 UI 冻住。*
+
+<a id="s13"></a>
+
+## 场景是什么、为什么这么设计
+
+单纯"记住一批窗口"解决不了真问题:换场合时
+用户要的是**切换**,不是重新勾一遍。所以场景的定义是"藏这批 + 放掉别的场景藏的
+那批",而**手动勾选藏的窗口永远不动** —— 那是用户自己的临时决定,不该被场景
+覆盖。切换语义写死在这三条规则里,没有隐藏开关。

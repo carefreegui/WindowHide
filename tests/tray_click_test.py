@@ -92,7 +92,20 @@ def main() -> int:
     time.sleep(0.3)
     check("再次点击后目标窗口恢复可见", win32.IsWindowVisible(target.hwnd))
 
-    print("[4] 清理 ...")
+    # 关窗口时的"已最小化到托盘"提示:必须有独立开关
+    # (用户反馈:每次关都被弹一下,想关掉)
+    print("[4] 关闭提示的独立开关 ...")
+    calls: list = []
+    tray.showMessage = lambda *a, **k: calls.append(a)
+    config.show_minimize_hint = False
+    win.close()
+    check("关掉后不再弹提示", not calls)
+    config.show_minimize_hint = True
+    win.show()
+    win.close()
+    check("开关打开时弹且只弹一次", len(calls) == 1)
+
+    print("[5] 清理 ...")
     controller.restore_all(wait=True)
     hotkeys.stop()
     tray.hide()

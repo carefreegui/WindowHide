@@ -88,6 +88,11 @@ class HideController(QObject):
         self._rule_tick = 0
         # 自动应用规则时"藏不掉"的进程:重试 3 次就放弃,别每 3 秒撞一次墙
         self._rule_fail: dict[int, int] = {}
+        # 在途意图:pid -> "hide" / "restore"。
+        # 异步隐藏有个几毫秒的真空期:窗口已经不可见了,但 _hidden 还没写进
+        # 去 —— 这期间用户再点一下,旧逻辑会判"还没藏",于是又藏一次(表现为
+        # "点了恢复没反应")。用这个表把"意图"也算进状态判断。
+        self._pending: dict[int, str] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._watch)
@@ -173,6 +178,15 @@ class HideController(QObject):
         with self._lock:
             return any(hwnd in hp.records for hp in self._hidden.values())
 
+    def is_pid_hidden_or_pending(self, pid: int) -> bool:
+        """已隐藏 **或** 正在隐藏 —— 用来判"这次点击该藏还是该放"。
+
+        只看 `_hidden` 会漏掉异步隐藏落地前的那几毫秒,用户连点两下就会
+        变成"藏两次",而"恢复"根本没被执行。
+        """
+        with self._lock:
+            return pid in self._hidden or self._pending.get(pid) == "hide"
+
     def hidden_summary(self) -> tuple[int, int]:
         """(隐藏的进程数, 隐藏的窗口数)"""
         with self._lock:
@@ -243,6 +257,8 @@ class HideController(QObject):
             # 工作线程收尾里 —— 否则"自动藏→用户点恢复"的交错会把恢复请求
             # 擦掉,窗口 3 秒后又被藏回去(实测踩过)。
             self._opt_out.difference_update(pids)
+            for pid in pids:
+                self._pending[pid] = "hide"
         if wait:
             self._wait_idle()
             return self._hide_pids_blocking(pids, mute=mute, profile=profile)
@@ -261,6 +277,11 @@ class HideController(QObject):
         for pid in dict.fromkeys(pids):
             with self._lock:
                 if pid in self._hidden:
+                    self._pending.pop(pid, None)
+                    continue
+                if self._pending.get(pid) == "restore":
+                    # 藏的过程中用户又点了恢复:别藏了,让恢复请求去做它的事
+                    self._pending.pop(pid, None)
                     continue
             # 权限不够就别动 —— UIPI 会把窗口操作静默吃掉,只留下一个
             # "最小化了但点不回来"的烂摊子(永劫无间实测事故)。
@@ -290,6 +311,8 @@ class HideController(QObject):
             if hp and hp.window_count > 0:
                 with self._lock:
                     self._hidden[pid] = hp
+                    if self._pending.get(pid) == "hide":
+                        self._pending.pop(pid, None)
                 done += 1
                 if hp.failed:
                     failed += hp.failed
@@ -437,6 +460,8 @@ class HideController(QObject):
         # 「规则持续生效」三秒后又把它藏回去
         with self._lock:
             self._opt_out.update(pids)
+            for pid in pids:
+                self._pending[pid] = "restore"
         if wait:
             self._wait_idle()
             return self._restore_pids_blocking(pids)
@@ -448,6 +473,8 @@ class HideController(QObject):
         for pid in pids:
             with self._lock:
                 hp = self._hidden.pop(pid, None)
+                if self._pending.get(pid) == "restore":
+                    self._pending.pop(pid, None)
             if not hp:
                 continue
             try:
@@ -505,10 +532,11 @@ class HideController(QObject):
         """
         if not hwnds:
             return "none"
-        any_hidden = any(self.is_hwnd_hidden(h) for h in hwnds)
-        if any_hidden:
-            pids = {win32.get_window_pid(h) for h in hwnds if self.is_hwnd_hidden(h)}
-            self.restore_pids([p for p in pids if p])
+        pids = {win32.get_window_pid(h) for h in hwnds}
+        pids.discard(0)
+        hidden_pids = {p for p in pids if self.is_pid_hidden_or_pending(p)}
+        if hidden_pids:
+            self.restore_pids(list(hidden_pids))
             return "restored"
         self.hide_hwnds(hwnds)
         return "hidden"
