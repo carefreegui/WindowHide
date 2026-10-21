@@ -22,6 +22,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from . import protect
 from . import win32
 from .audio import set_process_mute
 from .targets import TargetRule
@@ -51,6 +52,7 @@ class HiddenProcess:
     muted: bool = False
     failed: int = 0  # 权限不足等原因未能隐藏的窗口数
     hung: bool = False  # 目标已无响应,整个进程都没碰
+    profile: str = ""   # 由哪个场景藏的("" = 手动勾选)
 
     @property
     def window_count(self) -> int:
@@ -64,6 +66,8 @@ class HideController(QObject):
     action_done = Signal(str, int)    # (action, count) action: hidden/restored/failed
     hide_incomplete = Signal(int, str)  # (藏不掉的窗口数, 原因提示)
     privilege_blocked = Signal(str)   # 目标进程权限比我们高(UIPI 拦死)
+    protected_skipped = Signal(str)   # 命中了"永不隐藏"名单,已跳过
+    profile_changed = Signal(str)     # 当前场景变了(托盘菜单要更新勾选)
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -77,6 +81,13 @@ class HideController(QObject):
         self._lock = threading.RLock()     # 保护 _hidden / _retry
         self._busy_lock = threading.Lock()
         self._busy = False                 # 有任务在跑,别叠加
+        self._queued: tuple | None = None  # 忙时排队的最后一次请求
+        # 用户手动恢复过的进程:自动应用规则时不要马上又把它藏回去
+        # ("点恢复 → 3 秒后又没了"是我最讨厌的那种 bug)
+        self._opt_out: set[int] = set()
+        self._rule_tick = 0
+        # 自动应用规则时"藏不掉"的进程:重试 3 次就放弃,别每 3 秒撞一次墙
+        self._rule_fail: dict[int, int] = {}
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._watch)
@@ -88,6 +99,7 @@ class HideController(QObject):
         with self._lock:
             data = {"version": 1, "hidden": [
                 {"pid": hp.pid, "process_name": hp.process_name, "muted": hp.muted,
+                 "profile": hp.profile,
                  "records": [{"hwnd": r.hwnd, "ex_style": r.ex_style,
                               "show_cmd": r.show_cmd, "title": r.title,
                               "fullscreen": r.fullscreen}
@@ -116,7 +128,8 @@ class HideController(QObject):
                 continue
             hp = HiddenProcess(pid=pid,
                                process_name=str(entry.get("process_name", "")),
-                               muted=bool(entry.get("muted", False)))
+                               muted=bool(entry.get("muted", False)),
+                               profile=str(entry.get("profile", "")))
             for rec in entry.get("records", []):
                 try:
                     hwnd = int(rec["hwnd"])
@@ -170,16 +183,22 @@ class HideController(QObject):
     def _submit(self, fn, *args) -> bool:
         """把跨进程动作丢到工作线程去做,主线程立刻返回。
 
-        同一时刻只允许一个后台任务:两次隐藏叠在一起会互相踩状态,
-        而且用户连点按钮时第二次本来也没意义。
+        同一时刻只跑一个后台任务(两次隐藏叠在一起会互相踩状态)。
+        但**不丢请求**:忙的时候记住最后一次,忙完接着做。
+        以前是直接丢掉,表现就是"点了恢复毫无反应" —— 隐藏一个大程序
+        要几百毫秒,用户很容易在这个窗口里点第二下。
         """
         with self._busy_lock:
             if self._busy:
+                self._queued = (fn, args)
                 from ..log import write
-                write("上一次隐藏/恢复还没结束,本次请求已忽略")
-                return False
+                write("上一个隐藏/恢复还没结束,本次请求已排队")
+                return True
             self._busy = True
+        self._start(fn, args)
+        return True
 
+    def _start(self, fn, args) -> None:
         def run():
             try:
                 fn(*args)
@@ -189,31 +208,56 @@ class HideController(QObject):
             finally:
                 with self._busy_lock:
                     self._busy = False
+                    nxt = self._queued
+                    self._queued = None
                 # 收尾刷新一次:即便中途失败,界面也该反映真实状态
                 self.state_changed.emit()
+                if nxt is not None:
+                    self._start(nxt[0], nxt[1])
 
         threading.Thread(target=run, name="hide-worker", daemon=True).start()
-        return True
+
+    def _wait_idle(self, timeout: float = 5.0) -> None:
+        """等后台任务做完(同步调用前先用,避免和正在跑的隐藏/恢复打架)。"""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self._busy_lock:
+                if not self._busy:
+                    self._queued = None      # 自己要做的事优先,排队的不做了
+                    return
+            time.sleep(0.02)
 
     # ------------------------------------------------------------ 隐藏
-    def hide_pids(self, pids: list[int], wait: bool = False) -> int:
+    def hide_pids(self, pids: list[int], wait: bool = False,
+                  mute: bool | None = None, profile: str = "") -> int:
         """隐藏指定进程的所有可见顶层窗口。
 
         `wait=False`(默认)时丢到工作线程去做、立即返回 0 —— 界面调用一律
         用这个,主线程绝不碰跨进程窗口调用(目标卡住会把 UI 一起冻死)。
         `wait=True` 是同步版本,给测试和"退出前必须做完"的路径用。
+        `mute=True` 用于场景自带的"顺带静音";None 表示只看全局设置。
+        `profile` 记录"是哪个场景藏的",切换场景时要据此回收。
         """
+        with self._lock:
+            # 用户主动藏 = 撤销"别再自动藏我"。必须在这里做,不能放在
+            # 工作线程收尾里 —— 否则"自动藏→用户点恢复"的交错会把恢复请求
+            # 擦掉,窗口 3 秒后又被藏回去(实测踩过)。
+            self._opt_out.difference_update(pids)
         if wait:
-            return self._hide_pids_blocking(pids)
-        self._submit(self._hide_pids_blocking, list(pids))
+            self._wait_idle()
+            return self._hide_pids_blocking(pids, mute=mute, profile=profile)
+        self._submit(self._hide_pids_blocking, list(pids), mute, profile)
         return 0
 
-    def _hide_pids_blocking(self, pids: list[int]) -> int:
+    def _hide_pids_blocking(self, pids: list[int], mute: bool | None = None,
+                            profile: str = "", quiet: bool = False) -> int:
         done = 0
         failed = 0
         failed_names: list[str] = []
         blocked_names: list[str] = []
         hung_names: list[str] = []
+        protected_names: list[str] = []
+        extra = self._settings.protected_processes
         for pid in dict.fromkeys(pids):
             with self._lock:
                 if pid in self._hidden:
@@ -221,13 +265,16 @@ class HideController(QObject):
             # 权限不够就别动 —— UIPI 会把窗口操作静默吃掉,只留下一个
             # "最小化了但点不回来"的烂摊子(永劫无间实测事故)。
             name = win32.process_image_path(pid).rsplit("\\", 1)[-1] or f"pid {pid}"
+            if protect.is_protected(name, extra):
+                protected_names.append(f"{name}({protect.reason(name, extra)})")
+                continue
             if win32.process_is_higher_integrity(pid):
                 blocked_names.append(name)
                 continue
             # 单个进程出任何意外都不能拖垮整批(以前一个异常就让剩下
             # 勾选的窗口一个都不藏)
             try:
-                hp = self._hide_one(pid)
+                hp = self._hide_one(pid, mute=mute, profile=profile)
             except Exception:
                 from ..log import write
                 write(f"隐藏 {name} 时出现异常:\n{traceback.format_exc()}")
@@ -251,6 +298,24 @@ class HideController(QObject):
             self._save_state()
             self.state_changed.emit()
             self.action_done.emit("hidden", done)
+        if quiet:
+            # 自动应用规则时憋住气泡:每 3 秒弹一次"没藏掉"比不藏还烦。
+            # 只写日志,让愿意排查的人查得到。
+            if protected_names or blocked_names or hung_names or failed:
+                from ..log import write
+                write("自动应用规则时跳过:"
+                      + " ".join(filter(None, [
+                          ("受保护:" + "、".join(protected_names)) if protected_names else "",
+                          ("权限不足:" + "、".join(blocked_names)) if blocked_names else "",
+                          ("无响应:" + "、".join(hung_names)) if hung_names else "",
+                          ("藏不掉:" + "、".join(failed_names)) if failed else "",
+                      ])))
+            return done
+        if protected_names:
+            names = "、".join(dict.fromkeys(protected_names))
+            self.protected_skipped.emit(
+                f"{names} 属于系统/输入关键进程,已跳过 —— 藏掉它可能导致"
+                "打不出字、桌面异常。可在设置里调整自定义名单。")
         if blocked_names:
             names = "、".join(dict.fromkeys(blocked_names))
             self.privilege_blocked.emit(
@@ -270,13 +335,14 @@ class HideController(QObject):
                         "通常是它以独占全屏渲染,不接受隐藏指令。")
         return done
 
-    def hide_hwnds(self, hwnds: list[int], wait: bool = False) -> int:
+    def hide_hwnds(self, hwnds: list[int], wait: bool = False,
+                   mute: bool | None = None, profile: str = "") -> int:
         """隐藏窗口列表(按进程归组)。`wait=True` 供测试同步断言。"""
         pids: list[int] = []
         for hwnd in hwnds:
             if win32.IsWindow(hwnd):
                 pids.append(win32.get_window_pid(hwnd))
-        return self.hide_pids(pids, wait=wait)
+        return self.hide_pids(pids, wait=wait, mute=mute, profile=profile)
 
     def hide_foreground(self, wait: bool = False) -> int:
         """隐藏当前前台窗口所属的进程。
@@ -314,7 +380,8 @@ class HideController(QObject):
             return True
         return False
 
-    def _hide_one(self, pid: int) -> HiddenProcess | None:
+    def _hide_one(self, pid: int, mute: bool | None = None,
+                  profile: str = "") -> HiddenProcess | None:
         name = ""
         records: dict[int, WindowRecord] = {}
         failed = 0
@@ -335,7 +402,8 @@ class HideController(QObject):
                                            fullscreen)
             # 判据是"真的不在屏幕上了"(隐藏或最小化),不是 IsWindowVisible ——
             # 全屏游戏被最小化时 IsWindowVisible 依然是 True。
-            if not win32.is_offscreen(w.hwnd):
+            # 必须等一小会儿:异步 SW_HIDE 刚投递时窗口还是可见的。
+            if not win32.wait_offscreen(w.hwnd, 0.3):
                 failed += 1
         if not records:
             return HiddenProcess(pid=pid, process_name=name, hung=hung) \
@@ -346,14 +414,14 @@ class HideController(QObject):
             name = win32.process_image_path(pid).rsplit("\\", 1)[-1]
 
         hp = HiddenProcess(pid=pid, process_name=name, records=records,
-                           failed=failed, hung=hung)
+                           failed=failed, hung=hung, profile=profile)
         if failed:
             from ..log import write
             write(f"未能隐藏的窗口:{name}(pid={pid}) 失败 {failed}/{len(records)} 个")
         # 托盘图标
         delete_process_tray_icons(pid)
-        # 静音
-        if self._settings.mute_on_hide:
+        # 静音(场景自带的静音优先,否则看全局设置)
+        if mute or self._settings.mute_on_hide:
             n = set_process_mute(pid, True)
             hp.muted = n > 0
         return hp
@@ -365,7 +433,12 @@ class HideController(QObject):
         return self.restore_pids(pids, wait=wait)
 
     def restore_pids(self, pids: list[int], wait: bool = False) -> int:
+        # 手动恢复 = 用户明确表示"这个不要再藏了" —— 记下来,免得
+        # 「规则持续生效」三秒后又把它藏回去
+        with self._lock:
+            self._opt_out.update(pids)
         if wait:
+            self._wait_idle()
             return self._restore_pids_blocking(pids)
         self._submit(self._restore_pids_blocking, list(pids))
         return 0
@@ -440,6 +513,87 @@ class HideController(QObject):
         self.hide_hwnds(hwnds)
         return "hidden"
 
+    # ------------------------------------------------------------ 场景
+    def activate_profile(self, name: str, wait: bool = False) -> bool:
+        """切换到某个场景:藏该场景命中的窗口,放掉别的场景藏的窗口。
+
+        语义写清楚,免得用户以为"点了一下没反应":
+        - **藏**:当前可见、且命中该场景规则的窗口(跳过本工具、桌面/任务栏、
+          受保护进程、无响应窗口);
+        - **放**:之前被**另一个场景**藏起来的进程 —— 换场景就该换一批;
+          手动勾选藏的不动(那是用户自己的选择);
+        - 没有命中任何窗口时会如实提示,不会假装切过去了。
+        """
+        profile = self._settings.profile(name)
+        if profile is None:
+            return False
+        self._settings.set_active(profile.name)
+
+        def run():
+            self._apply_profile(profile)
+            # 场景是用户点出来的,把结果落盘(下次启动还是这个场景)
+            try:
+                self._settings.save()
+            except Exception:
+                pass
+            self.profile_changed.emit(profile.name)
+
+        if wait:
+            self._wait_idle()
+            run()
+            return True
+        return self._submit(run)
+
+    def _apply_profile(self, profile) -> None:
+        # 先给在途的异步显示/隐藏一点时间落地。切场景常常发生在"刚点过恢复"
+        # 之后,而恢复走的是 ShowWindowAsync/SetWindowPlacement —— 目标线程
+        # 还没处理完的时候枚举,会看到窗口"还没显示"从而漏掉它。
+        # 这里跑在工作线程,200ms 不影响界面。
+        time.sleep(0.2)
+        # 1) 放掉其它场景藏的(只动场景藏的,手动的不碰)
+        with self._lock:
+            release = [hp.pid for hp in self._hidden.values()
+                       if hp.profile and hp.profile != profile.name]
+        if release:
+            self._restore_pids_blocking(release)
+
+        # 2) 藏本场景命中的
+        target_pids = self._profile_targets(profile)
+        if not target_pids:
+            # 刚放出来的窗口可能还没真正"可见"(恢复也是异步落地的),
+            # 这时候扫一遍会是空的。等一小会儿再扫,最多约 1 秒 ——
+            # 否则用户"恢复完立刻切场景"就会漏掉窗口,以为场景坏了。
+            for _ in range(5):
+                time.sleep(0.2)
+                target_pids = self._profile_targets(profile)
+                if target_pids:
+                    break
+        if not target_pids:
+            self.action_done.emit("profile_empty", 0)
+            return
+        self._hide_pids_blocking(target_pids, mute=profile.mute,
+                                 profile=profile.name)
+
+    def _profile_targets(self, profile) -> list[int]:
+        """当前可见、命中该场景规则、且不该被跳过的进程。"""
+        extra = self._settings.protected_processes
+        our_pid = os.getpid()
+        with self._lock:
+            already = set(self._hidden.keys())
+        out: list[int] = []
+        for w in win32.enum_top_level_windows():
+            # 注意:这里**不看** opt_out —— 用户主动点了场景,就该按场景办;
+            # opt_out 只用来约束"自动应用规则"那种后台行为。
+            if not w.visible or w.pid in already:
+                continue
+            if w.pid == our_pid or win32.is_shell_window(w.hwnd):
+                continue
+            if protect.is_protected(w.process_name, extra):
+                continue
+            if any(rule.matches(w) for rule in profile.rules):
+                out.append(w.pid)
+        return out
+
     # ------------------------------------------------------------ 持续隐藏
     def _watch(self) -> None:
         """看门狗(主线程每 1 秒跑一次)。
@@ -447,6 +601,9 @@ class HideController(QObject):
         这里只做"读"和"判断",真正的窗口操作丢给工作线程 —— 主线程
         绝不允许出现任何可能阻塞的跨进程调用。
         """
+        self._rule_tick += 1
+        if self._rule_tick % 3 == 0:
+            self._watch_rules()
         if not self._hidden:
             return
         dirty = False
@@ -476,6 +633,66 @@ class HideController(QObject):
         if targets:
             self._submit(self._rehide, targets)
 
+    def _watch_rules(self) -> None:
+        """「规则持续生效」:目标程序重启后,按当前场景再自动藏一次。
+
+        默认关闭(设置里叫「规则持续生效」)。以前规则只在启动时匹配一次,
+        目标一重启就永远不管了 —— 那就不是"生效",只是"记住"。
+        """
+        if not self._settings.auto_apply_rules:
+            return
+        profile = self._settings.active()
+        if profile is None or not profile.rules:
+            return
+        # 清掉已经退出的 opt_out:pid 会被系统回收,留着会误放新进程一马
+        with self._lock:
+            self._opt_out = {p for p in self._opt_out
+                             if win32.process_is_alive(p)}
+            self._rule_fail = {p: n for p, n in self._rule_fail.items()
+                               if win32.process_is_alive(p)}
+        self._submit(self._apply_rules_worker, profile.name)
+
+    def _apply_rules_worker(self, profile_name: str) -> None:
+        """工作线程:按场景规则找新出现的窗口并隐藏。"""
+        profile = self._settings.profile(profile_name)
+        if profile is None or not profile.rules:
+            return
+        extra = self._settings.protected_processes
+        our_pid = os.getpid()
+        with self._lock:
+            already = set(self._hidden.keys())
+            opt_out = set(self._opt_out)
+            hopeless = {p for p, n in self._rule_fail.items() if n >= 3}
+        target_pids: list[int] = []
+        for w in win32.enum_top_level_windows():
+            if not w.visible or w.minimized:
+                continue
+            if w.pid == our_pid or w.pid in already \
+                    or w.pid in opt_out or w.pid in hopeless:
+                continue
+            if win32.is_shell_window(w.hwnd):
+                continue
+            if protect.is_protected(w.process_name, extra):
+                continue
+            if any(rule.matches(w) for rule in profile.rules):
+                target_pids.append(w.pid)
+        if not target_pids:
+            return
+        before = self.hidden_summary()[0]
+        self._hide_pids_blocking(target_pids, mute=profile.mute,
+                                 profile=profile.name, quiet=True)
+        after = self.hidden_summary()[0]
+        # 藏不掉的别每 3 秒重试一遍(白耗 CPU,日志也会淹)
+        with self._lock:
+            for pid in target_pids:
+                if pid in self._hidden:
+                    continue
+                self._rule_fail[pid] = self._rule_fail.get(pid, 0) + 1
+        if after > before:
+            from ..log import write
+            write(f"规则持续生效:按场景「{profile.name}」自动隐藏 "
+                  f"{after - before} 个程序")
+
     def _rehide(self, hwnds: list[int]) -> None:
         """补刀:目标程序自己又把窗口弹出来了,再藏一次(工作线程里跑)。"""
         for hwnd in hwnds:
@@ -489,7 +706,7 @@ class HideController(QObject):
             fullscreen = win32.is_fullscreen_window(hwnd)
             ex_style, show_cmd = win32.hide_window(
                 hwnd, allow_minimize=self._settings.force_fullscreen_hide)
-            if win32.is_offscreen(hwnd):
+            if win32.wait_offscreen(hwnd, 0.3):
                 self._retry.pop(hwnd, None)
             else:
                 self._retry[hwnd] = self._retry.get(hwnd, 0) + 1

@@ -1,8 +1,11 @@
-"""tests/hang_probe.py - 制造一个"无响应"窗口(建好后停止 pumps 消息)。
+"""tests/hang_probe.py - 制造一个"无响应"或"极慢"的窗口。
 
-配合 hang_test.py 使用:验证枚举/取标题不会因该窗口无限期阻塞。
-窗口创建后进入 45 秒不 pumps 消息的循环,任何向它发消息的
-调用方(GetWindowText / WM_GETICON)都会被拖住。
+配合 hang_test.py / hung_test.py 使用:
+
+  默认        建好窗口后彻底不 pump 消息(45 秒)—— 任何向它发消息的
+              调用方(GetWindowText / WM_GETICON)都会被拖住;
+  --slow      消息循环每条消息睡 250ms —— 模拟"主线程很忙但没死"的
+              程序,取标题会吃满 100ms 超时。用来验证"慢窗口缓存"。
 """
 from __future__ import annotations
 
@@ -50,6 +53,15 @@ def main() -> None:
         return
     user32.ShowWindow(hwnd, 1)
     print(f"hang window hwnd={hwnd}", flush=True)
+
+    if "--slow" in sys.argv:
+        # 慢速消息循环:每条消息前睡 250ms
+        msg = wintypes.MSG()
+        while True:
+            while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            time.sleep(0.25)
 
     # 关键:不再 pumps 消息 —— 窗口进入"无响应"状态
     t0 = time.time()

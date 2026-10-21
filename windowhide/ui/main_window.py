@@ -7,12 +7,13 @@ import os
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPushButton, QStatusBar, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QComboBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
+    QMenu, QMessageBox, QPushButton, QStatusBar, QSystemTrayIcon, QVBoxLayout,
+    QWidget,
 )
 
 from ..config import Config
-from ..core import win32
+from ..core import protect, win32
 from ..core.classify import TYPE_LABELS, classify_window
 from ..core.hide import HideController
 from ..core.hotkeys import HotkeyManager
@@ -76,10 +77,13 @@ class MainWindow(QMainWindow):
         # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
         # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
         self._btn_restore = QPushButton("恢复")
-        self._btn_save_target = QPushButton("保存为目标")
+        self._btn_profile = QPushButton("场景")
+        self._btn_profile_menu = QMenu(self._btn_profile)
+        self._btn_profile.setMenu(self._btn_profile_menu)
+        self._btn_profile_menu.aboutToShow.connect(self._rebuild_profile_menu)
         self._btn_settings = QPushButton("设置")
         for b in (self._btn_hide, self._btn_restore,
-                  self._btn_save_target, self._btn_settings):
+                  self._btn_profile, self._btn_settings):
             top.addWidget(b)
         v.addLayout(top)
 
@@ -102,7 +106,6 @@ class MainWindow(QMainWindow):
     def _wire(self) -> None:
         self._btn_hide.clicked.connect(self._hide_checked)
         self._btn_restore.clicked.connect(self._restore_all)
-        self._btn_save_target.clicked.connect(self._save_targets)
         self._btn_settings.clicked.connect(self._open_settings)
         self._btn_all.clicked.connect(self._table.toggle_all_checked)
         self._btn_invert.clicked.connect(self._table.invert_checked)
@@ -114,6 +117,8 @@ class MainWindow(QMainWindow):
         self._controller.action_done.connect(self._on_action)
         self._controller.hide_incomplete.connect(self._on_hide_incomplete)
         self._controller.privilege_blocked.connect(self._on_privilege_blocked)
+        self._controller.protected_skipped.connect(self._on_protected_skipped)
+        self._controller.profile_changed.connect(self._on_profile_changed)
         self._hotkeys.triggered.connect(self._on_hotkey)
         self._hotkeys.register_failed.connect(self._on_hotkey_failed)
 
@@ -123,6 +128,7 @@ class MainWindow(QMainWindow):
         self._tray.act_elevate.triggered.connect(self._restart_as_admin)
         self._tray.act_quit.triggered.connect(self._quit)
         self._tray.activated.connect(self._on_tray_activated)
+        self._tray.profile_menu.aboutToShow.connect(self._rebuild_tray_profiles)
 
     # ---------------------------------------------------------------- 数据
     def refresh(self) -> None:
@@ -147,6 +153,7 @@ class MainWindow(QMainWindow):
             w.process_name = w.process_name or win32.process_image_path(w.pid).rsplit("\\", 1)[-1]
             if not w.process_path:
                 w.process_path = win32.process_image_path(w.pid)
+        self._protected = protect.protected_set(self._config.protected_processes)
         self._apply_filter()
         self._update_status()
 
@@ -166,7 +173,8 @@ class MainWindow(QMainWindow):
     def _apply_filter(self) -> None:
         our_pid = win32.get_window_pid(int(self.winId()))
         self._table.refresh(self._filtered_windows(),
-                            self._controller.hidden_hwnds(), our_pid)
+                            self._controller.hidden_hwnds(), our_pid,
+                            getattr(self, "_protected", set()))
 
     def _update_status(self) -> None:
         n_proc, n_win = self._controller.hidden_summary()
@@ -176,11 +184,14 @@ class MainWindow(QMainWindow):
         else:
             self._tray.set_hiding(False)
             self._tray.set_state_text("运行中")
+        scene = self._config.active_profile
+        scene_txt = f"场景「{scene}」·" if scene else ""
         if n_proc:
             self.statusBar().showMessage(
-                f"后台运行中:已隐藏 {n_win} 个窗口({n_proc} 个程序),程序未关闭")
+                f"{scene_txt}后台运行中:已隐藏 {n_win} 个窗口({n_proc} 个程序),程序未关闭")
         else:
-            self.statusBar().showMessage("就绪:勾选窗口后点击「隐藏勾选」,或按全局快捷键")
+            self.statusBar().showMessage(
+                f"{scene_txt}就绪:勾选窗口后点击「隐藏勾选」,或按全局快捷键")
 
     # ---------------------------------------------------------------- 动作
     def _current_targets(self) -> list[int]:
@@ -230,23 +241,105 @@ class MainWindow(QMainWindow):
         if self._config.show_balloon:
             self._tray.showMessage("窗口隐藏工具", "已收进托盘,双击图标唤回主界面")
 
-    def _save_targets(self) -> None:
-        hwnds = self._table.checked_hwnds()
-        if not hwnds:
-            QMessageBox.information(self, "提示", "请先勾选窗口,再保存为目标规则。")
+    # ---------------------------------------------------------------- 场景
+    def _rebuild_profile_menu(self) -> None:
+        m = self._btn_profile_menu
+        m.clear()
+        active = self._config.active_profile
+        if self._config.profiles:
+            for p in self._config.profiles:
+                act = m.addAction(p.name)
+                act.setCheckable(True)
+                act.setChecked(p.name == active)
+                act.triggered.connect(
+                    lambda _checked=False, n=p.name: self._switch_profile(n))
+            m.addSeparator()
+        else:
+            act = m.addAction("(还没有场景)")
+            act.setEnabled(False)
+            m.addSeparator()
+        m.addAction("把勾选的窗口加入当前场景", self._add_checked_to_profile)
+        m.addAction("新建场景…(用勾选的窗口)", self._new_profile_with_checked)
+        m.addAction("在设置里管理场景…", self._open_settings)
+
+    def _rebuild_tray_profiles(self) -> None:
+        m = self._tray.profile_menu
+        m.clear()
+        active = self._config.active_profile
+        if not self._config.profiles:
+            act = m.addAction("(还没有场景)")
+            act.setEnabled(False)
             return
+        for p in self._config.profiles:
+            act = m.addAction(p.name)
+            act.setCheckable(True)
+            act.setChecked(p.name == active)
+            act.triggered.connect(
+                lambda _checked=False, n=p.name: self._switch_profile(n))
+
+    def _switch_profile(self, name: str) -> None:
+        self._controller.activate_profile(name)
+        # 场景名要立刻反映到状态栏;真正的隐藏结果由 state_changed 驱动刷新
+        self._config.active_profile = name
+        self._update_status()
+
+    def _scene_name(self) -> str:
+        p = self._config.active()
+        return p.name if p else "默认"
+
+    def _add_rules_to(self, profile, hwnds: list[int]) -> int:
         by_hwnd = {w.hwnd: w for w in self._windows}
         added = 0
         for hwnd in hwnds:
             w = by_hwnd.get(hwnd)
             if not w:
                 continue
+            if protect.is_protected(w.process_name,
+                                    self._config.protected_processes):
+                continue
             rule = TargetRule.from_window(w)
-            if rule not in self._config.targets:
-                self._config.targets.append(rule)
+            if rule not in profile.rules:
+                profile.rules.append(rule)
                 added += 1
+        return added
+
+    def _add_checked_to_profile(self) -> None:
+        hwnds = self._table.checked_hwnds()
+        if not hwnds:
+            QMessageBox.information(
+                self, "提示",
+                "请先勾选窗口,再把它们加入场景。\n"
+                "场景 = 一批窗口的集合,切到该场景时这些窗口会被一起隐藏。")
+            return
+        profile = self._config.ensure_profile(self._config.active_profile or "默认")
+        added = self._add_rules_to(profile, hwnds)
         self._config.save()
-        QMessageBox.information(self, "已保存", f"新增 {added} 条目标规则。")
+        self._update_status()
+        QMessageBox.information(
+            self, "已保存",
+            f"向场景「{profile.name}」新增 {added} 条规则"
+            + ("(重复的已跳过)" if added < len(hwnds) else "") + "。")
+
+    def _new_profile_with_checked(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "新建场景", "场景名称(例如:上班 / 摸鱼 / 游戏):")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if name in self._config.profile_names():
+            QMessageBox.warning(self, "重名", f"已经有叫「{name}」的场景了。")
+            return
+        from ..config import Profile
+        profile = Profile(name=name)
+        self._config.profiles.append(profile)
+        self._config.set_active(name)
+        added = self._add_rules_to(profile, self._table.checked_hwnds())
+        self._config.save()
+        self.refresh()
+        QMessageBox.information(
+            self, "场景已创建",
+            f"场景「{name}」已创建,包含 {added} 条规则。\n"
+            "以后点托盘菜单里的场景名就能一键切换。")
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._config, self)
@@ -291,8 +384,15 @@ class MainWindow(QMainWindow):
         write("界面提示: " + msg)
 
     def _on_action(self, action: str, count: int) -> None:
-        self.refresh()
         from ..log import write
+        if action == "profile_empty":
+            msg = ("当前场景里没有匹配的窗口 —— 可能是相关程序还没打开,"
+                   "或者规则里写的进程名对不上。")
+            self.statusBar().showMessage("提示:" + msg)
+            if self._config.show_balloon:
+                self._tray.showMessage("场景没匹配到窗口", msg)
+            return
+        self.refresh()
         if action == "hidden":
             write(f"隐藏 {count} 个程序(转入后台)")
             if self._config.show_balloon:
@@ -301,6 +401,11 @@ class MainWindow(QMainWindow):
             write(f"恢复 {count} 个程序")
             if self._config.show_balloon:
                 self._tray.showMessage("已恢复", f"{count} 个程序已恢复显示")
+
+    def _on_profile_changed(self, name: str) -> None:
+        self.refresh()
+        from ..log import write
+        write(f"切换场景:{name}")
 
     def _restart_as_admin(self) -> None:
         """以管理员身份重启自己。
@@ -339,6 +444,13 @@ class MainWindow(QMainWindow):
         """目标权限比我们高:说清原因,别让用户以为工具坏了。"""
         self.statusBar().showMessage("警告:" + msg)
         self._tray.showMessage("需要管理员权限", msg)
+        from ..log import write
+        write("界面提示: " + msg)
+
+    def _on_protected_skipped(self, msg: str) -> None:
+        """命中了保护名单:同样要说出来,否则用户以为工具没反应。"""
+        self.statusBar().showMessage("已跳过:" + msg)
+        self._tray.showMessage("已跳过受保护的进程", msg)
         from ..log import write
         write("界面提示: " + msg)
 

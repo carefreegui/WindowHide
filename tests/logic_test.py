@@ -19,8 +19,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from windowhide.config import (  # noqa: E402
-    Config, HotkeySpec, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    Config, HotkeySpec, Profile, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
 )
+from windowhide.core import protect  # noqa: E402
 from windowhide.core.classify import classify_window, type_label  # noqa: E402
 from windowhide.core.hotkeys import hotkey_label  # noqa: E402
 from windowhide.core.targets import TargetRule  # noqa: E402
@@ -157,10 +158,127 @@ def test_hotkey_label() -> None:
           hotkey_label(MOD_CONTROL, 0x31))
 
 
+def test_profiles() -> None:
+    print("== 场景(profile) ==")
+    c = Config()
+    check("默认没有场景", c.profiles == [] and c.targets == [])
+    c.targets = [TargetRule(process="notepad.exe")]
+    check("写 targets 自动建默认场景",
+          [p.name for p in c.profiles] == ["默认"] and c.active_profile == "默认",
+          str([p.name for p in c.profiles]))
+
+    c.profiles.append(Profile(name="上班", rules=[TargetRule(process="steam.exe")],
+                              mute=True))
+    check("set_active 切场景", c.set_active("上班") and c.targets[0].process == "steam.exe")
+    check("set_active 不存在的名字返回 False", c.set_active("没这个") is False)
+    check("profile 取当前场景", c.profile().name == "上班")
+
+    d = c.to_dict()
+    c2 = Config.from_dict(d)
+    check("场景往返:数量", len(c2.profiles) == 2)
+    check("场景往返:静音标记", c2.profile("上班").mute is True)
+    check("场景往返:规则", c2.profile("上班").rules[0].process == "steam.exe")
+    check("场景往返:当前场景", c2.active_profile == "上班")
+    check("config 是 v2", d["version"] == 2)
+
+    # v1 迁移:平铺 targets 收进"默认"场景
+    c3 = Config.from_dict({"version": 1, "targets": [
+        {"process": "a.exe", "window_class": "", "title_regex": "", "label": "A"}]})
+    check("v1 迁移成默认场景",
+          len(c3.profiles) == 1 and c3.profiles[0].name == "默认"
+          and c3.profiles[0].rules[0].process == "a.exe")
+    check("v1 迁移后当前场景有值", c3.active_profile == "默认")
+
+    # 同名场景会把"按名字找"变成掷骰子
+    c4 = Config.from_dict({"profiles": [{"name": "A"}, {"name": "A"},
+                                        {"name": "B"}], "active_profile": "A"})
+    check("同名场景去重", [p.name for p in c4.profiles] == ["A", "B"],
+          str([p.name for p in c4.profiles]))
+
+    # 脏数据
+    c5 = Config.from_dict({"profiles": [{"name": 123, "rules": "x", "mute": "yes"}]})
+    check("脏场景数据不崩", c5.profiles[0].name == "默认"
+          and c5.profiles[0].rules == [] and c5.profiles[0].mute is False)
+    c6 = Config.from_dict({"active_profile": "不存在的场景",
+                           "profiles": [{"name": "A"}]})
+    check("当前场景不存在时回落到第一个", c6.active_profile == "A")
+
+
+def test_protect() -> None:
+    print("== 永不隐藏名单 ==")
+    check("内置:dwm", protect.is_protected("dwm.exe"))
+    check("内置:输入法", protect.is_protected("TextInputHost.exe"))
+    check("大小写不敏感", protect.is_protected("DWM.EXE"))
+    check("普通程序不受保护", not protect.is_protected("notepad.exe"))
+    check("空名字不受保护", not protect.is_protected(""))
+    check("自定义名单命中", protect.is_protected("a.exe", ["a.exe"]))
+    check("自定义名单自动补 .exe", protect.is_protected("b.exe", ["B"]))
+    check("自定义名单空值忽略", not protect.is_protected("c.exe", ["", "  "]))
+    check("理由文案", protect.reason("dwm.exe") == "桌面窗口管理器",
+          protect.reason("dwm.exe"))
+    check("自定义理由", protect.reason("a.exe", ["a"]) == "你在设置里标记为不隐藏")
+    check("不受保护时理由为空", protect.reason("nope.exe") == "")
+    check("protected_set 合并内置与自定义",
+          "dwm.exe" in protect.protected_set(["x"]) and "x.exe" in protect.protected_set(["x"]))
+
+
+def test_migration_and_log() -> None:
+    """配置升级备份 + 日志轮转。用临时 APPDATA,不碰真实配置。"""
+    print("== 配置升级与日志轮转 ==")
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    from windowhide import log
+
+    old_base = os.environ.get("APPDATA")
+    tmp = Path(tempfile.mkdtemp(prefix="wh-logic-"))
+    os.environ["APPDATA"] = str(tmp)
+    try:
+        app = tmp / "WindowHide"
+        app.mkdir(parents=True, exist_ok=True)
+        v1 = {"version": 1, "mute_on_hide": True,
+              "targets": [{"process": "a.exe", "window_class": "",
+                           "title_regex": "", "label": "A"}]}
+        (app / "config.json").write_text(json.dumps(v1), encoding="utf-8")
+
+        loaded = Config.load()
+        check("升级后规则没丢", loaded.targets and loaded.targets[0].process == "a.exe")
+        check("升级后写成 v2",
+              json.loads((app / "config.json").read_text(encoding="utf-8"))["version"] == 2)
+        check("升级前留了备份", (app / "config.v1.bak.json").exists())
+
+        # 再读一次不能又备份一份/又改一次
+        before = (app / "config.json").read_bytes()
+        Config.load()
+        check("二次加载不再改文件",
+              (app / "config.json").read_bytes() == before)
+
+        # 日志轮转:写 >2MB
+        line = "x" * 1000
+        for i in range(2400):
+            log.write(f"{i} {line}")
+        files = log.log_files()
+        sizes = [f.stat().st_size for f in files]
+        check("产生了轮转文件", len(files) >= 2, f"{len(files)} 个")
+        check("单文件不超 1.1MB", all(s < 1_100_000 for s in sizes), str(sizes))
+        check("总占用有上限(≤3MB)", sum(sizes) <= 3 * 1024 * 1024, str(sum(sizes)))
+    finally:
+        if old_base is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = old_base
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     test_classify()
     test_targets()
     test_config()
+    test_profiles()
+    test_protect()
+    test_migration_and_log()
     test_hotkey_label()
     failed = [r for r in results if not r[1]]
     print(f"\n通过 {len(results) - len(failed)}/{len(results)}")

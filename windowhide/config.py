@@ -1,9 +1,18 @@
-"""config.py - 配置持久化(JSON,存于 %APPDATA%/WindowHide/)。"""
+"""config.py - 配置持久化(JSON,存于 %APPDATA%/WindowHide/)。
+
+配置格式版本:
+  v1  一次性平铺的 `targets` 列表
+  v2  场景(profiles):一批规则打包成一个可命名的场景("上班"/"游戏"…),
+      可以一键切换。v1 读进来会自动迁移成 v2,原文件备份成
+      `config.v1.bak.json` —— 用户手写过的配置不能因为我们升级就丢了。
+"""
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
+import shutil
+from dataclasses import dataclass, field
+
 from pathlib import Path
 
 from .core.targets import TargetRule
@@ -13,6 +22,9 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
+
+CONFIG_VERSION = 2
+DEFAULT_PROFILE = "默认"
 
 
 @dataclass(slots=True)
@@ -30,6 +42,31 @@ class HotkeySpec:
     @classmethod
     def from_dict(cls, d: dict) -> "HotkeySpec":
         return cls(mods=int(d.get("mods", 0)), vk=int(d.get("vk", 0)))
+
+
+@dataclass(slots=True)
+class Profile:
+    """一个场景:一组目标规则 + 该场景是否顺带静音。"""
+    name: str = DEFAULT_PROFILE
+    rules: list[TargetRule] = field(default_factory=list)
+    mute: bool = False
+
+    def to_dict(self) -> dict:
+        return {"name": self.name,
+                "rules": [r.to_dict() for r in self.rules],
+                "mute": self.mute}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Profile":
+        name = d.get("name")
+        rules = d.get("rules")
+        mute = d.get("mute")
+        return cls(
+            name=name.strip() if isinstance(name, str) and name.strip() else DEFAULT_PROFILE,
+            rules=[TargetRule.from_dict(r) for r in rules if isinstance(r, dict)]
+            if isinstance(rules, list) else [],
+            mute=mute if isinstance(mute, bool) else False,
+        )
 
 
 def app_dir() -> Path:
@@ -68,14 +105,64 @@ class Config:
     # 游戏自己回不来、工具也跟着卡死。默认行为是"藏不掉就如实说",
     # 至少不会把用户的对局搞没。
     force_fullscreen_hide: bool = False
+    # 规则持续生效:目标程序重启后自动按当前场景再藏一次。
+    # 默认关闭 —— "打开就被藏"对没预期的人很吓人
+    auto_apply_rules: bool = False
 
-    # 目标规则
-    targets: list[TargetRule] = field(default_factory=list)
+    # 场景
+    profiles: list[Profile] = field(default_factory=list)
+    active_profile: str = ""
+
+    # 永不隐藏的额外进程(内置名单在 core/protect.py,这里只放用户自定义)
+    protected_processes: list[str] = field(default_factory=list)
+
+    # ---------------------------------------------------------------- 场景
+    def profile_names(self) -> list[str]:
+        return [p.name for p in self.profiles]
+
+    def profile(self, name: str | None = None) -> Profile | None:
+        """按名字找场景;不传名字就取当前场景。找不到返回 None。"""
+        want = self.active_profile if name is None else name
+        for p in self.profiles:
+            if p.name == want:
+                return p
+        return self.profiles[0] if (name is None and self.profiles) else None
+
+    def active(self) -> Profile | None:
+        return self.profile(None)
+
+    def ensure_profile(self, name: str = DEFAULT_PROFILE) -> Profile:
+        """取场景,不存在就建一个并设为当前。"""
+        p = self.profile(name)
+        if p is None:
+            p = Profile(name=name)
+            self.profiles.append(p)
+        self.active_profile = p.name
+        return p
+
+    def set_active(self, name: str) -> bool:
+        for p in self.profiles:
+            if p.name == name:
+                self.active_profile = p.name
+                return True
+        return False
+
+    @property
+    def targets(self) -> list[TargetRule]:
+        """当前场景的规则(兼容旧的 `config.targets` 用法)。"""
+        p = self.active()
+        return p.rules if p else []
+
+    @targets.setter
+    def targets(self, rules: list[TargetRule]) -> None:
+        """给当前场景整批换规则;没有场景就建一个"默认"场景。"""
+        p = self.ensure_profile(self.active_profile or DEFAULT_PROFILE)
+        p.rules = list(rules)
 
     # ---------------------------------------------------------------- 持久化
     def to_dict(self) -> dict:
         return {
-            "version": 1,
+            "version": CONFIG_VERSION,
             "hotkey_mode": self.hotkey_mode,
             "hotkey_toggle": self.hotkey_toggle.to_dict(),
             "hotkey_hide": self.hotkey_hide.to_dict(),
@@ -88,7 +175,10 @@ class Config:
             "show_balloon": self.show_balloon,
             "autostart": self.autostart,
             "force_fullscreen_hide": self.force_fullscreen_hide,
-            "targets": [t.to_dict() for t in self.targets],
+            "auto_apply_rules": self.auto_apply_rules,
+            "profiles": [p.to_dict() for p in self.profiles],
+            "active_profile": self.active_profile,
+            "protected_processes": list(self.protected_processes),
         }
 
     @classmethod
@@ -110,13 +200,42 @@ class Config:
             c.hotkey_hide_self = HotkeySpec.from_dict(d["hotkey_foreground"])
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",
                     "minimize_to_tray", "show_balloon", "autostart",
-                    "force_fullscreen_hide"):
+                    "force_fullscreen_hide", "auto_apply_rules"):
             # 只认真正的布尔值:bool("yes") 会静默变成 True,把用户
             # 手改坏的配置读成"开",排查起来极其费劲
             if isinstance(d.get(key), bool):
                 setattr(c, key, d[key])
-        c.targets = [TargetRule.from_dict(t) for t in d.get("targets", [])
-                     if isinstance(t, dict)] if isinstance(d.get("targets"), list) else []
+
+        profiles = d.get("profiles")
+        if isinstance(profiles, list):
+            # 同名场景会让"按名字找场景"变成掷骰子,直接去重(保留第一个)
+            uniq: list[Profile] = []
+            seen: set[str] = set()
+            for p in profiles:
+                if not isinstance(p, dict):
+                    continue
+                prof = Profile.from_dict(p)
+                if prof.name in seen:
+                    continue
+                seen.add(prof.name)
+                uniq.append(prof)
+            c.profiles = uniq
+        if not c.profiles:
+            # v1 迁移:平铺的 targets 收进一个叫"默认"的场景
+            old = d.get("targets")
+            rules = [TargetRule.from_dict(t) for t in old
+                     if isinstance(t, dict)] if isinstance(old, list) else []
+            if rules:
+                c.profiles = [Profile(name=DEFAULT_PROFILE, rules=rules)]
+
+        active = d.get("active_profile")
+        c.active_profile = active if isinstance(active, str) else ""
+        if c.profiles and not any(p.name == c.active_profile for p in c.profiles):
+            c.active_profile = c.profiles[0].name
+
+        extra = d.get("protected_processes")
+        c.protected_processes = [x for x in extra if isinstance(x, str) and x.strip()] \
+            if isinstance(extra, list) else []
         return c
 
     def save(self) -> None:
@@ -132,9 +251,26 @@ class Config:
     def load(cls) -> "Config":
         path = app_dir() / "config.json"
         try:
-            return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return cls()
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
+        cfg = cls.from_dict(raw)
+        try:
+            version = int(raw.get("version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+        if version < CONFIG_VERSION:
+            # 备份再升级 —— 用户手写过的配置丢了没法找回
+            try:
+                backup = path.with_name(f"config.v{version}.bak.json")
+                if not backup.exists():
+                    shutil.copy2(path, backup)
+            except OSError:
+                pass
+            cfg.save()
+        return cfg
 
     # ---------------------------------------------------------------- 自启动
     def apply_autostart(self) -> None:

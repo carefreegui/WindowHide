@@ -106,7 +106,42 @@ def main() -> int:
     check("提示文案点明了无响应",
           bool(hints) and "无响应" in hints[0][1])
 
-    print("== 4. 对照组:同一个调用路径,响应正常的窗口照样能藏 ==")
+    print("== 4. 慢窗口不再拖慢列表刷新(慢窗口缓存) ==")
+    # 实测过:3 个挂起窗口能把一次全量刷新从 31ms 拉到 349ms ——
+    # 取标题要等满 100ms 超时,而且每轮都重新等一遍。
+    # 用 --slow 探针(每条消息睡 250ms:活着但很忙)稳定复现"取标题慢"。
+    slow_proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "tests" / "hang_probe.py"), "--slow"],
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    slow = wait_for(lambda: next(
+        (w for w in win32.enum_top_level_windows()
+         if w.class_name == "WHHangProbeWnd" and w.hwnd != win.hwnd), None))
+    if not slow:
+        check("慢窗口探针起来了", False)
+        slow_proc.kill()
+    else:
+        win32.clear_slow_cache()
+        t0 = time.perf_counter()
+        ws = win32.enum_top_level_windows()
+        first = (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        for _ in range(3):
+            win32.enum_top_level_windows()
+        later = (time.perf_counter() - t0) / 3 * 1000
+        check("第二轮明显更快(不再重复等超时)", later < first - 50,
+              f"首次 {first:.0f}ms → 之后 {later:.0f}ms")
+        check("慢窗口被记住", win32.is_known_slow(slow.hwnd))
+        check("记住后不再返回标题(省掉每次 100ms 等待)",
+              not win32.get_window_text(slow.hwnd))
+        check("慢窗口被标记 hung(界面显示「无响应」)",
+              any(w.hung for w in ws if w.hwnd == slow.hwnd))
+        slow_proc.kill()
+        try:
+            slow_proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    print("== 5. 对照组:同一个调用路径,响应正常的窗口照样能藏 ==")
     dummy = subprocess.Popen(
         [sys.executable, str(ROOT / "tests" / "dummy_app.py")],
         creationflags=subprocess.CREATE_NO_WINDOW)
@@ -127,9 +162,9 @@ def main() -> int:
         check("正常窗口被正常隐藏", not bool(win32.IsWindowVisible(d.hwnd)))
         controller.restore_all(wait=True)
 
-    print("== 5. 收尾 ==")
+    print("== 6. 收尾 ==")
     controller._timer.stop()
-    for p in (proc, dummy):
+    for p in (proc, dummy, slow_proc):
         p.kill()
         try:
             p.wait(timeout=5)

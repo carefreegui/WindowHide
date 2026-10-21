@@ -98,7 +98,7 @@ class WindowTable(QTableWidget):
             self._checked.discard(hwnd)
 
     def refresh(self, windows: list[WindowInfo], hidden_hwnds: set[int],
-                our_pid: int) -> None:
+                our_pid: int, protected: set[str] | None = None) -> None:
         # 定时器每 1.5s 会整体重建表格;勾选状态和滚动位置必须保留,
         # 否则用户刚勾的窗口下一秒就被取消,根本没法累积选择。
         old_checked = self._checked
@@ -106,12 +106,14 @@ class WindowTable(QTableWidget):
 
         self._syncing = True
         try:
-            self._rebuild_rows(windows, hidden_hwnds, our_pid, old_checked)
+            self._rebuild_rows(windows, hidden_hwnds, our_pid, old_checked,
+                               protected or set())
         finally:
             self._syncing = False
         self.verticalScrollBar().setValue(scroll)
 
-    def _rebuild_rows(self, windows, hidden_hwnds, our_pid, old_checked) -> None:
+    def _rebuild_rows(self, windows, hidden_hwnds, our_pid, old_checked,
+                      protected: set[str]) -> None:
         self.setRowCount(0)
         self._hwnds = []
         self._checked = set()
@@ -138,8 +140,15 @@ class WindowTable(QTableWidget):
             app_item.setIcon(icon)
             self.setItem(row, COL_APP, app_item)
 
-            # 标题
-            self.setItem(row, COL_TITLE, QTableWidgetItem(win.title or "(无标题)"))
+            # 标题(无响应的要写明,否则用户只看到标题空着,以为工具没刷新)
+            if win.title:
+                title_item = QTableWidgetItem(win.title)
+            elif win.hung:
+                title_item = QTableWidgetItem("(无响应)")
+                title_item.setForeground(QColor("#94a3b8"))
+            else:
+                title_item = QTableWidgetItem("(无标题)")
+            self.setItem(row, COL_TITLE, title_item)
 
             # 类型
             tkey = self._win_type(win)
@@ -147,15 +156,28 @@ class WindowTable(QTableWidget):
             type_item.setForeground(QColor(type_color(tkey)))
             self.setItem(row, COL_TYPE, type_item)
 
-            # 状态
+            # 状态:已隐藏 / 显示中 / 受保护
             hidden = win.hwnd in hidden_hwnds
-            status_item = QTableWidgetItem(_STATE_LABELS[hidden])
-            if hidden:
-                status_item.setForeground(QColor("#b45309"))
+            is_protected = (win.process_name or "").lower() in protected
+            if is_protected:
+                status_item = QTableWidgetItem("受保护")
+                status_item.setForeground(QColor("#94a3b8"))
+                status_item.setToolTip("系统/输入关键进程,隐藏它会连带影响桌面或输入法")
+            else:
+                status_item = QTableWidgetItem(_STATE_LABELS[hidden])
+                if hidden:
+                    status_item.setForeground(QColor("#b45309"))
             self.setItem(row, COL_STATUS, status_item)
 
             # PID
             self.setItem(row, COL_PID, QTableWidgetItem(str(win.pid)))
+
+            if is_protected:
+                # 复选框保留但不可勾:让用户看见"我知道这个窗口,但不动它",
+                # 比直接从列表里消失(以为工具坏了)好
+                chk.setFlags(Qt.ItemIsEnabled)
+                chk.setCheckState(Qt.Unchecked)
+                self._checked.discard(win.hwnd)
 
             if win.pid == our_pid:
                 for col in range(6):

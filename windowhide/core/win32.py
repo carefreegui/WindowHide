@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -366,6 +367,7 @@ class WindowInfo:
     process_name: str = ""
     process_path: str = ""
     rect: tuple[int, int, int, int] = (0, 0, 0, 0)  # left, top, right, bottom
+    hung: bool = False        # 线程"未响应"(IsHungAppWindow),界面上要标出来
 
     @property
     def is_toolwindow(self) -> bool:
@@ -384,14 +386,67 @@ def get_window_text(hwnd: int) -> str:
     必须用带超时的 SendMessageTimeoutW 而不是 GetWindowTextW:
     GetWindowTextW 内部向目标窗口所在线程发 WM_GETTEXT,遇到无响应的
     进程会无限期阻塞调用方(曾导致隐藏操作整个卡死)。
+
+    **慢窗口记忆**:不 pump 消息的窗口每问一次都要等满 100ms,而列表
+    每 1.5s 全量刷新一轮 —— 实测 3 个这种窗口就让刷新从 31ms 变成
+    349ms,点界面像卡住。所以第一次发现"问标题很慢"就把 hwnd 记下来,
+    之后 30 秒内直接返回空串、一次 IPC 都不发。
     """
+    if is_known_slow(hwnd):
+        return ""
     buf = ctypes.create_unicode_buffer(512)
     result = wintypes.ULONG(0)
+    started = time.monotonic()
     n = SendMessageTimeoutW(hwnd, WM_GETTEXT, 512,
                             ctypes.cast(buf, ctypes.c_void_p).value,
                             SMTO_ABORTIFHUNG, SEND_MSG_TIMEOUT_MS,
                             ctypes.byref(result))
+    cost = time.monotonic() - started
+    # 判"慢"只看耗时,不看结果空不空:空标题的窗口是瞬间返回的,
+    # 而卡住的窗口必然吃满超时。用耗时判定才不会把空标题误标成无响应。
+    if cost >= SLOW_TITLE_SECONDS:
+        _mark_slow(hwnd)
+        return ""
+    _forget_slow(hwnd)
     return buf.value if n > 0 else ""
+
+
+# ---------------------------------------------------------------- 慢窗口缓存
+SLOW_TITLE_SECONDS = 0.04     # 一次取标题超过 40ms 就当"这窗口不值得再问"
+SLOW_TITLE_TTL = 30.0         # 记多久;过期后重试一次(它可能已经恢复了)
+_slow_until: dict[int, float] = {}
+_slow_lock = threading.Lock()
+
+
+def _mark_slow(hwnd: int) -> None:
+    with _slow_lock:
+        _slow_until[hwnd] = time.monotonic() + SLOW_TITLE_TTL
+        if len(_slow_until) > 512:
+            now = time.monotonic()
+            for h in [h for h, t in _slow_until.items() if t < now]:
+                del _slow_until[h]
+
+
+def _forget_slow(hwnd: int) -> None:
+    with _slow_lock:
+        _slow_until.pop(hwnd, None)
+
+
+def is_known_slow(hwnd: int) -> bool:
+    """这个窗口近期是否被记成"问标题要等很久"。"""
+    with _slow_lock:
+        until = _slow_until.get(hwnd)
+        if until is None:
+            return False
+        if until < time.monotonic():
+            del _slow_until[hwnd]
+            return False
+        return True
+
+
+def clear_slow_cache() -> None:
+    with _slow_lock:
+        _slow_until.clear()
 
 
 def get_class_name(hwnd: int) -> str:
@@ -524,8 +579,13 @@ def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
 
     pid 非 None 时只收集该进程的窗口 —— 在回调里就按 pid 过滤,
     避免对全系统窗口逐个取标题(既慢又会放大无响应窗口的影响面)。
+
+    **process_name 一定要在这里填好**。以前留给调用方自己补,结果规则匹配
+    (`TargetRule.matches` 比较进程名)在控制器里悄悄全部失配 —— 场景切了
+    一个窗口都没藏,还不报错。按 pid 缓存,同一进程只查一次,可忽略成本。
     """
     result: list[WindowInfo] = []
+    names: dict[int, str] = {}
 
     @WNDENUMPROC
     def _cb(hwnd, _lparam):
@@ -534,20 +594,31 @@ def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
         # 注意:GetParent 的 restype 是 HWND(c_void_p),无父窗口时返回 None
         if GetParent(hwnd):
             return True  # 只收顶层
-        if pid is not None and get_window_pid(hwnd) != pid:
+        wpid = get_window_pid(hwnd)
+        if pid is not None and wpid != pid:
             return True
         try:
             style, ex_style = get_window_styles(hwnd)
+            title = get_window_text(hwnd)
+            if wpid not in names:
+                names[wpid] = process_image_path(wpid).rsplit("\\", 1)[-1]
             result.append(WindowInfo(
                 hwnd=int(hwnd),
-                pid=get_window_pid(hwnd),
-                title=get_window_text(hwnd),
+                pid=wpid,
+                title=title,
                 class_name=get_class_name(hwnd),
                 visible=bool(IsWindowVisible(hwnd)),
                 minimized=bool(IsIconic(hwnd)),
                 ex_style=ex_style,
                 style=style,
                 rect=get_window_rect(hwnd),
+                process_name=names[wpid],
+                # 界面上要能看出"这窗口无响应",否则用户只会看到标题空着,
+                # 以为是工具没刷新出来。
+                # 只在"标题取不到"时才问内核:有标题就说明它活着,而
+                # IsHungAppWindow 对 188 个窗口逐个查要多花 ~20ms。
+                hung=is_known_slow(int(hwnd))
+                     or (not title and bool(IsHungAppWindow(hwnd))),
             ))
         except Exception:
             pass
@@ -750,6 +821,11 @@ def _wait_offscreen(hwnd: int, timeout: float) -> bool:
         time.sleep(0.05)
 
 
+def wait_offscreen(hwnd: int, timeout: float = 0.3) -> bool:
+    """等窗口真的离开屏幕(隐藏或最小化)。给上层判成败用。"""
+    return _wait_offscreen(hwnd, timeout)
+
+
 def _wait_hidden(hwnd: int, timeout: float) -> bool:
     """轮询等待 SW_HIDE 真正生效(WS_VISIBLE 被清掉)。
 
@@ -816,11 +892,14 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
         return ex_style, show_cmd
 
     ShowWindowAsync(hwnd, SW_HIDE)
-    if not is_offscreen(hwnd):
-        # 兜底:再投一次(异步,不会等目标线程)
+    if not _wait_hidden(hwnd, 0.4):
+        # 兜底:再投一次(异步,不会等目标线程)。投完再等一小会儿 ——
+        # 异步操作立刻检查必然是"还没生效",上层会把成功当失败上报
+        # (实测日志里全是"未能隐藏 ... 失败 1/1",其实窗口已经藏了)。
         SetWindowPos(hwnd, None, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
                      | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_ASYNCWINDOWPOS)
+        _wait_hidden(hwnd, 0.3)
     return ex_style, show_cmd
 
 

@@ -106,10 +106,33 @@ def find_dummy():
     return None
 
 
+def backup_config() -> Path | None:
+    """把用户真实配置挪到一边 —— 这个测试会覆盖 config.json,
+    以前跑一次就把用户自己的规则/热键换成了测试用的(踩过)。"""
+    cfg = APPDATA / "config.json"
+    if not cfg.exists():
+        return None
+    bak = APPDATA / "config.e2e.bak.json"
+    bak.write_bytes(cfg.read_bytes())
+    return bak
+
+
+def restore_config(bak: Path | None) -> None:
+    cfg = APPDATA / "config.json"
+    try:
+        if bak is not None and bak.exists():
+            cfg.write_bytes(bak.read_bytes())
+            bak.unlink()
+        elif cfg.exists():
+            cfg.unlink()      # 本来就没有配置,别留一份测试配置在用户目录
+    except OSError:
+        pass
+
+
 def write_config(mods: int, vk: int) -> None:
     APPDATA.mkdir(parents=True, exist_ok=True)
     cfg = {
-        "version": 1,
+        "version": 2,
         "hotkey_mode": "toggle",
         "hotkey_toggle": {"mods": mods, "vk": vk},
         "hotkey_hide": {"mods": mods, "vk": vk},
@@ -121,10 +144,15 @@ def write_config(mods: int, vk: int) -> None:
         "minimize_to_tray": True,
         "show_balloon": True,
         "autostart": False,
-        "targets": [
-            {"process": "python.exe", "window_class": "WHDummyAppWnd",
-             "title_regex": "", "label": "测试目标窗口"}
+        "auto_apply_rules": False,
+        "protected_processes": [],
+        "profiles": [
+            {"name": "测试", "mute": False, "rules": [
+                {"process": "python.exe", "window_class": "WHDummyAppWnd",
+                 "title_regex": "", "label": "测试目标窗口"}
+            ]}
         ],
+        "active_profile": "测试",
     }
     (APPDATA / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
@@ -136,6 +164,7 @@ def main() -> int:
         return 1
     mods, vk, name = probe
     print(f"[0] 选用热键: {name}")
+    config_backup = backup_config()
     write_config(mods, vk)
 
     print("[1] 启动 dummy_app ...")
@@ -208,6 +237,7 @@ def main() -> int:
     gui.terminate()   # 结束 wrapper;真身可能残留,交给系统回收
     if find_dummy():
         dummy.kill()
+    restore_config(config_backup)
 
     ok = registered and hidden and alive and visible
     print("E2E 结果:", "PASS" if ok else "FAIL")
