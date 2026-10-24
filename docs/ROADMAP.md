@@ -43,10 +43,20 @@
 
 `hide_pids` per-pid `try/except`,异常写日志并计入失败,继续处理下一个。
 
-### ⬜ P0-4 免 Python 的发行版(未做,发布最大短板)
+### ✅ P0-4 免 Python 的发行版(已完成)
 
 `tools/build_exe.py` + PyInstaller `--onefile --windowed`,manifest 用
-`asInvoker`(故意不默认要求管理员)。验收:没装 Python 的机器双击能跑。
+`asInvoker`(故意不默认要求管理员),图标 `windowhide/assets/icon.ico`。
+
+- 实测产物 **45.6 MB**,启动 **2.1 秒**,进程名 `WindowHide.exe`
+- 体积能压到 46MB 靠排除用不到的 Qt 模块(QtWebEngine/QtQuick/Qt3D…)
+- 新增 `tests/exe_smoke_test.py` 验收打包产物:启动/图标/热键注册/
+  真实隐藏与恢复(9/9 通过)
+- 单实例、提权重启都在 exe 下调过(`_restart_as_admin` 修了 frozen 分支:
+  以前会把 exe 自己当脚本参数再传一次)
+
+剩下没验的:**真·没装 Python 的机器**(我这台有,只能靠 `--onefile` 的
+隔离性推断)。另外 exe 没有代码签名,首次运行会过 SmartScreen。
 
 ### ⬜ P0-5 管理员权限目标的真机闭环(需要人配合)
 

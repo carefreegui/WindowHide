@@ -67,6 +67,25 @@
 
 ## 快速开始
 
+### 方式一:直接用 exe(不用装 Python)
+
+拿 `dist/WindowHide.exe`(或 Release 里那个)双击就行 —— 单文件,不依赖
+Python / PySide6。首次启动约 2 秒(单文件要先解包到 `%TEMP%`)。
+
+自己打一个:
+
+```bat
+.venv\Scripts\pip install pyinstaller
+.venv\Scripts\python tools\build_exe.py
+:: 产物:dist\WindowHide.exe(约 46 MB)
+```
+
+> 首次运行 Windows 可能弹「已保护你的电脑」(SmartScreen)—— 这是所有
+> 没有代码签名的个人开发 exe 的通病,点「更多信息 → 仍要运行」。
+> 个别杀软会误报 PyInstaller 打包的程序,加信任即可。
+
+### 方式二:源码运行
+
 ```bash
 # 1. 建虚拟环境并装依赖(推荐,run.bat 会优先用它)
 python -m venv .venv
@@ -261,6 +280,29 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 产品侧对应加固:恢复时取消静音带重试(会话可能被系统临时回收),
 否则用户恢复窗口后应用会一直静着。
 
+### 打包 exe
+
+```bat
+.venv\Scripts\pip install pyinstaller
+.venv\Scripts\python tools\build_exe.py --clean
+.venv\Scripts\python tests\exe_smoke_test.py   # 验收打包产物
+```
+
+几个刻意的选择:
+
+- **onefile + windowed**:传给别人只有一个文件,而且不弹黑框。代价是启动要
+  先解包(约 2 秒)。
+- **manifest 用 `asInvoker`**:故意不默认要求管理员 —— 否则"藏个普通程序"
+  每次都弹 UAC;要管管理员程序时走托盘里的「以管理员身份重启」。
+- **图标资源**:`--add-data` 把 `windowhide/assets` 打进包里,运行时按
+  `sys._MEIPASS` 找(`ui/icon.py` 的 `asset_dir()`)。
+- **体积裁剪**:排除掉用不到的 Qt 模块(QtWebEngine/QtQuick/Qt3D…),
+  150MB+ 压到 46MB。改排除表之后**必须真跑一次 exe** —— 有些模块是被
+  Qt 插件反向依赖的,排掉后启动就崩,而打包过程不会有任何提示。
+
+`tests/exe_smoke_test.py` 是打包产物的验收:启动耗时、进程名、图标、
+热键注册、真实隐藏/恢复一个窗口。
+
 ### 更多
 
 技术细节(为什么任务栏会消失、全屏游戏为什么藏不掉、无响应目标怎么防卡死、
@@ -287,6 +329,9 @@ UIPI 权限、托盘图标怎么删)都在 **[docs/DESIGN.md](docs/DESIGN.md)**�
 - **每次关窗口都弹一下「已最小化到托盘」,烦?** 设置 →「行为」→ 取消
   「关闭主界面时提示「已最小化到托盘」」。想彻底安静,再把上面那条
   「隐藏 / 恢复时弹出托盘气泡提示」也取消。
+- **exe 被杀软拦了 / 提示未知发布者?** PyInstaller 打包的个人程序没有代码
+  签名,SmartScreen 和部分杀软会拦。点「更多信息 → 仍要运行」,或把 exe 加进
+  信任列表。也可以用源码跑(`run.bat`),功能完全一样。
 - **快捷键没反应?** 组合键可能被其它软件占用,在设置里换一个组合。
 - **恢复后托盘图标没回来?** 少数程序不处理 `TaskbarCreated` 消息,手动重启
   该程序即可,不影响窗口隐藏/恢复本身。

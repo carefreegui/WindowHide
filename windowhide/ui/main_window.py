@@ -445,14 +445,21 @@ class MainWindow(QMainWindow):
         import sys
         from pathlib import Path
 
-        # 入口脚本路径:优先用启动时的 argv[0],取不到就按包位置推 run.pyw
-        script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
-        if not script or not os.path.exists(script):
-            script = str(Path(__file__).resolve().parents[2] / "run.pyw")
+        if getattr(sys, "frozen", False):
+            # 打包成 exe 后 sys.executable 就是自己:参数只能给 --elevated,
+            # 不能再把 exe 自己当脚本传进去(否则命令行变成
+            # `WindowHide.exe WindowHide.exe --elevated`)
+            target, params = sys.executable, "--elevated"
+        else:
+            # 入口脚本路径:优先用启动时的 argv[0],取不到就按包位置推 run.pyw
+            script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+            if not script or not os.path.exists(script):
+                script = str(Path(__file__).resolve().parents[2] / "run.pyw")
+            target, params = sys.executable, f'"{script}" --elevated'
         # --elevated:跳过单实例检查 —— 此刻旧实例还在退出过程中,
         # 互斥体没释放,不跳过的话新进程会以为"已有一个实例"而直接退出。
         ret = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, f'"{script}" --elevated', None, 1)
+            None, "runas", target, params, None, 1)
         if int(ret) <= 32:
             self._tray.showMessage("提权失败", "管理员授权被取消,本次未重启")
             return
