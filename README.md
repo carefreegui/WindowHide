@@ -308,6 +308,8 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
 
 技术细节(为什么任务栏会消失、全屏游戏为什么藏不掉、无响应目标怎么防卡死、
 UIPI 权限、托盘图标怎么删)都在 **[docs/DESIGN.md](docs/DESIGN.md)**。
+想自己发版/发新版本:**[docs/GITHUB.md](docs/GITHUB.md)**(建仓库、push、tag、
+Release、CI 是什么,都写了)。
 优化路线见 [docs/ROADMAP.md](docs/ROADMAP.md),需要真人配合的测试清单见
 [docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)。
 
