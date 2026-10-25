@@ -15,7 +15,7 @@ No DLL injection, no global hooks, no synthetic input: only documented Win32 API
 [![python](https://img.shields.io/badge/python-3.10%2B-3776ab)](#quick-start)
 [![license](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
 
-[中文说明](README.md)
+[Download](../../releases) · [中文说明](README.md)
 
 </div>
 

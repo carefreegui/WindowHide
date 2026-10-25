@@ -13,7 +13,7 @@
 [![python](https://img.shields.io/badge/python-3.10%2B-3776ab)](#快速开始)
 [![license](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
 
-[快速开始](#快速开始) · [功能](#功能) · [场景](#场景推荐用法) · [配置](#配置文件) · [常见问题](#常见问题) · [设计笔记](docs/DESIGN.md) · [English](README.en.md)
+[快速开始](#快速开始) · [功能](#功能) · [场景](#场景推荐用法) · [配置](#配置文件) · [常见问题](#常见问题) · [设计笔记](docs/DESIGN.md) · [English](README.en.md) · [Releases](../../releases)
 
 </div>
 
@@ -69,7 +69,7 @@
 
 ### 方式一:直接用 exe(不用装 Python)
 
-拿 `dist/WindowHide.exe`(或 Release 里那个)双击就行 —— 单文件,不依赖
+到 [Releases](../../releases) 下 `WindowHide.exe`(或直接用 `dist/WindowHide.exe`)双击就行 —— 单文件,不依赖
 Python / PySide6。首次启动约 2 秒(单文件要先解包到 `%TEMP%`)。
 
 自己打一个:
