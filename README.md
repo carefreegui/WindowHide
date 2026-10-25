@@ -12,6 +12,7 @@
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4)](#运行环境)
 [![python](https://img.shields.io/badge/python-3.10%2B-3776ab)](#快速开始)
 [![license](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
+[![tests](https://github.com/carefreegui/WindowHide/actions/workflows/tests.yml/badge.svg)](https://github.com/carefreegui/WindowHide/actions/workflows/tests.yml)
 
 [快速开始](#快速开始) · [功能](#功能) · [场景](#场景推荐用法) · [配置](#配置文件) · [常见问题](#常见问题) · [设计笔记](docs/DESIGN.md) · [English](README.en.md) · [Releases](../../releases)
 
