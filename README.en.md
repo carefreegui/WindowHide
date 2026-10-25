@@ -33,11 +33,22 @@ No DLL injection, no global hooks, no synthetic input: only documented Win32 API
 - **Never hides critical processes** — `dwm.exe`, the IME host
   (`TextInputHost.exe`), the UWP frame host and friends are protected by default
   (you can add your own). Hiding them would break your desktop or your keyboard.
+- **Hides windows, not programs** — five browser windows open and you only want
+  three of them gone? Tick exactly those three. Windows are hidden one `HWND` at a
+  time, so the siblings of a multi-window Chromium/Electron process stay visible and
+  usable. When only part of a program is hidden, its tray icon and its audio are
+  left alone (both are per-process actions). Profiles stay per-program on purpose:
+  switching a profile hides every window of the programs it matches.
 - **Won't hang your desktop** — every cross-process window call runs on a worker
   thread, and windows owned by an unresponsive process are never touched
   (`IsHungAppWindow`). A stuck target can no longer freeze the UI.
 - **Mute on hide** — mutes the target program through the system volume mixer,
   including its child processes (browsers play audio in a child process).
+- **Per-program audio policy** — the「声音」column decides, per program, whether it
+  keeps playing audio while hidden (music player, background call) or follows the
+  global "mute on hide" setting. Windows mixes audio **per process**, so two windows
+  of one program cannot be muted independently; ticking this column keeps the sound
+  for every window of that program.
 - **Honest about failures** — if a window cannot be hidden (elevated process,
   exclusive-fullscreen game), you get a tray notification instead of silent
   "success". Nothing is left in a half-minimized, unreachable state.
@@ -71,6 +82,15 @@ Then:
 3. Press the global hotkey (default `Ctrl+Alt+H`) or single-click the tray icon to
    bring them back
 
+Ticking is per **window**: for a program with several open windows, only the ticked
+ones are hidden (double-clicking a row toggles that single window). The hotkey and
+the tray click act on the ticked windows; profile rules are only used when nothing
+is ticked.
+
+The「声音」(sound) column is per **program**: ticked means the program keeps playing
+audio while hidden; unticked means it follows "mute on hide". Changes apply
+immediately to programs that are already hidden.
+
 ## Configuration
 
 `%APPDATA%\WindowHide\config.json`, format version **2**:
@@ -84,7 +104,8 @@ Then:
      "rules": [{"process": "Steam.exe", "window_class": "", "title_regex": "", "label": "Steam"}]},
     {"name": "Game", "mute": false, "rules": []}
   ],
-  "protected_processes": ["SomeMonitoringAgent.exe"]
+  "protected_processes": ["SomeMonitoringAgent.exe"],
+  "keep_audio_processes": ["lx-music-desktop.exe"]
 }
 ```
 

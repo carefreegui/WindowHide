@@ -76,6 +76,10 @@ class MainWindow(QMainWindow):
         self._btn_hide = QPushButton("隐藏勾选")
         # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
         # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
+        self._btn_hide.setToolTip(
+            "只隐藏勾中的窗口。\n"
+            "同一个程序开了多个窗口(浏览器多开)时,没勾的窗口会原样留着。\n"
+            "「声音」列决定这个程序被藏起来后还要不要出声。")
         self._btn_restore = QPushButton("恢复")
         self._btn_profile = QPushButton("场景")
         self._btn_profile_menu = QMenu(self._btn_profile)
@@ -112,6 +116,7 @@ class MainWindow(QMainWindow):
         self._search.textChanged.connect(self._apply_filter)
         self._type_filter.currentIndexChanged.connect(self._apply_filter)
         self._table.row_activated.connect(self._toggle_hwnd)
+        self._table.sound_toggled.connect(self._on_sound_toggled)
 
         self._controller.state_changed.connect(self.refresh)
         self._controller.action_done.connect(self._on_action)
@@ -134,6 +139,9 @@ class MainWindow(QMainWindow):
     def refresh(self) -> None:
         our_pid = win32.get_window_pid(int(self.winId()))
         hidden = self._controller.hidden_hwnds()
+        # 在途的窗口也要算"留着":异步隐藏的真空期里它既不可见、也还没进
+        # 隐藏记录,不兜这一下,列表会把它删掉,连勾选一起没了。
+        alive = hidden | self._controller.pending_hwnds()
         try:
             windows = win32.enum_top_level_windows()
         except Exception:
@@ -141,7 +149,7 @@ class MainWindow(QMainWindow):
         # 可见窗口 + 被本工具隐藏的窗口(后者要在列表里显示"已隐藏")
         self._windows = [w for w in windows
                          if w.pid != our_pid
-                         and (w.visible or w.hwnd in hidden)
+                         and (w.visible or w.hwnd in alive)
                          # 桌面/任务栏(explorer 的 Progman/Shell_TrayWnd)
                          # 一律不列 —— 它们混进来就等于给了用户一个
                          # "一键把桌面藏了"的按钮
@@ -174,7 +182,9 @@ class MainWindow(QMainWindow):
         our_pid = win32.get_window_pid(int(self.winId()))
         self._table.refresh(self._filtered_windows(),
                             self._controller.hidden_hwnds(), our_pid,
-                            getattr(self, "_protected", set()))
+                            getattr(self, "_protected", set()),
+                            keep_audio=set(self._config.keep_audio_processes),
+                            mute_global=self._config.mute_on_hide)
 
     def _update_status(self) -> None:
         n_proc, n_win = self._controller.hidden_summary()
@@ -253,10 +263,30 @@ class MainWindow(QMainWindow):
         self._controller.toggle(self._current_targets())
 
     def _toggle_hwnd(self, hwnd: int) -> None:
-        if self._controller.is_hwnd_hidden(hwnd):
+        # 用"已隐藏或正在隐藏"判断,别用纯状态:隐藏是异步的,双击的
+        # 第二下若赶在落地之前,会看到"还没藏"从而再藏一次(点了恢复没反应)
+        if self._controller.is_hwnd_hidden_or_pending(hwnd):
             self._controller.restore_hwnd(hwnd)
         else:
             self._controller.hide_hwnds([hwnd])
+
+    def _on_sound_toggled(self, process_name: str, keep: bool) -> None:
+        """「声音」列:这个程序被隐藏时要不要继续出声。
+
+        为什么只能按程序设:系统音量合成器的会话是挂在**进程**上的,
+        同一个程序的多个窗口共用一路声音 —— 想让"这一个窗口静音、另一个
+        继续响"在 Windows 上做不到。所以这一列是程序级开关,同一程序的
+        所有行联动。
+        """
+        if self._config.set_keeps_audio(process_name, keep):
+            self._config.save()
+        n = self._controller.set_audio_policy(process_name, keep)
+        msg = (f"{process_name}:隐藏时继续播放声音"
+               if keep else f"{process_name}:隐藏时跟随全局静音设置")
+        if n:
+            msg += f"(已对隐藏中的 {n} 个窗口立即生效)"
+        self.statusBar().showMessage(msg)
+        self._update_status()
 
     def _hide_self(self) -> None:
         """把本工具主窗口收进托盘(与点叉号等效)。
@@ -423,13 +453,31 @@ class MainWindow(QMainWindow):
             return
         self.refresh()
         if action == "hidden":
-            write(f"隐藏 {count} 个程序(转入后台)")
+            # 计数改成**窗口**数:隐藏现在是可以只藏同一个程序里的一部分
+            # 窗口的,"N 个程序"会让用户以为整个程序都被收起来了
+            n_win, n_proc = self._controller.hidden_summary()
+            write(f"隐藏 {count} 处(当前共 {n_win} 个窗口 / {n_proc} 个程序)")
             if self._config.show_balloon:
-                self._tray.showMessage("已隐藏", f"{count} 个程序已转入后台,任务栏与托盘图标已隐藏")
+                self._tray.showMessage(
+                    "已隐藏",
+                    f"已隐藏 {n_win} 个窗口(涉及 {n_proc} 个程序),"
+                    "任务栏与托盘图标已隐藏")
+            # 只藏了一部分窗口却把整个程序静音了 —— 这类"意料之外的连带
+            # 影响"必须说出来,不然用户只会觉得工具坏了
+            muted = self._controller.partially_muted()
+            if muted:
+                self.statusBar().showMessage(
+                    "提示:" + "、".join(muted) + " 还有窗口在显示,"
+                    "但声音被整个程序静音了(声音只能按程序关)—— "
+                    "不想这样就到「声音」列勾上它")
         elif action == "restored":
-            write(f"恢复 {count} 个程序")
+            n_win, n_proc = self._controller.hidden_summary()
+            write(f"恢复 {count} 处(剩余 {n_win} 个窗口 / {n_proc} 个程序)")
             if self._config.show_balloon:
-                self._tray.showMessage("已恢复", f"{count} 个程序已恢复显示")
+                self._tray.showMessage(
+                    "已恢复",
+                    "窗口已全部恢复显示" if n_win == 0
+                    else f"已恢复;仍有 {n_win} 个窗口处于隐藏状态")
 
     def _on_profile_changed(self, name: str) -> None:
         self.refresh()
