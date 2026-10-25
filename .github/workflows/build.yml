@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    # 只做一件事:把每个 Python 文件编译一遍(语法/缩进/编码错误当场暴露)。
+    # 不跑业务测试 —— 那些需要真实的交互式 Windows 桌面,云端 runner 没有。
+    name: compile (windows)
+    runs-on: windows-latest
+    env:
+      # runner 默认 cp1252 控制台,任何中文输出都会崩;强制 UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile every module
+        run: python -m compileall -q windowhide tools run.pyw

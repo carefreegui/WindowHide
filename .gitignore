@@ -24,3 +24,10 @@ dist/
 
 # 早期界面截图:露了个人目录/文件名,不进仓库(文件本身保留在本地)
 tests/shot_gui.png
+
+# 本地私有:测试脚本、学习笔记、内部路线图
+# 公开仓库只放"能直接用的代码 + 说明",这些留本地
+tests/
+docs/ROADMAP.md
+docs/MANUAL_TESTS.md
+docs/GITHUB.md

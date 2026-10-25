@@ -12,7 +12,7 @@
 [![platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4)](#运行环境)
 [![python](https://img.shields.io/badge/python-3.10%2B-3776ab)](#快速开始)
 [![license](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
-[![tests](https://github.com/carefreegui/WindowHide/actions/workflows/tests.yml/badge.svg)](https://github.com/carefreegui/WindowHide/actions/workflows/tests.yml)
+[![build](https://github.com/carefreegui/WindowHide/actions/workflows/build.yml/badge.svg)](https://github.com/carefreegui/WindowHide/actions/workflows/build.yml)
 
 [快速开始](#快速开始) · [功能](#功能) · [场景](#场景推荐用法) · [配置](#配置文件) · [常见问题](#常见问题) · [设计笔记](docs/DESIGN.md) · [English](README.en.md) · [Releases](../../releases)
 
@@ -173,8 +173,8 @@ windowhide/
 ├── run.pyw / run.bat         # 入口(run.bat 自动探测带 PySide6 的解释器)
 ├── requirements.txt
 ├── LICENSE                   # MIT
-├── docs/                     # 界面截图 + 路线图 + 需要真人配合的测试清单
-├── .github/workflows/        # CI:纯逻辑测试(需真实桌面的不进去)
+├── docs/                     # 界面截图 + 实现说明
+├── .github/workflows/        # CI:每次 push 做一次全量语法编译检查
 ├── windowhide/
 │   ├── app.py                # 引导:QLocale 修复 / 单实例 / 装配
 │   ├── config.py             # JSON 配置 v2(%APPDATA%\WindowHide\config.json,含场景)
@@ -194,99 +194,24 @@ windowhide/
 │       ├── hotkey_edit.py    #   快捷键捕获按钮
 │       ├── tray.py           #   系统托盘
 │       └── icon.py           #   程序绘制图标(无外部资源)
-└── tests/
-    ├── logic_test.py         # 纯逻辑单元测试(分类/匹配/配置/热键文案,可进 CI)
-    ├── smoke_test.py         # 冒烟测试(枚举/分类/配置/托盘通路)
-    ├── integration_test.py   # 真实窗口隐藏恢复 + 托盘移除恢复 + 热键模拟
-    ├── audio_test.py         # 静音功能测试(播音探针 + 静音/取消/状态查询)
-    ├── audio_tree_test.py    # 进程树静音(父进程无会话、子进程播音,模拟浏览器)
-    ├── tray_click_test.py    # 托盘点击切换链路(进程内真实 MainWindow)
-    ├── checkbox_test.py      # 勾选行为回归(跨刷新保留/双击不误隐藏)
-    ├── hang_test.py          # 无响应窗口不阻塞测试(挂起探针)
-    ├── hung_test.py          # 无响应目标:不阻塞、不碰它、如实提示
-    ├── hotkey_rereg_test.py  # 热键重复注册回归(曾静默死亡,现有回归测试)
-    ├── hide_state_test.py    # 隐藏状态持久化回归(重启/多实例不丢)
-    ├── foreground_test.py    # 前台窗口隐藏 core 回归(桌面/自藏保护)
-    ├── fullscreen_test.py    # 全屏窗口回归(判定/先最小化再隐藏/失败上报)
-    ├── profile_test.py       # 场景切换/保护名单/规则持续生效(临时 APPDATA)
-    ├── gui_e2e.py            # GUI 端到端(启动真实程序,按键验证隐藏恢复)
-    ├── dummy_app.py          # 测试专用假目标窗口(含 --fullscreen 全屏模式)
-    ├── hang_probe.py         # 无响应窗口探针(测试辅助)
-    ├── tray_probe.py         # 托盘图标探针(测试辅助)
-    ├── audio_probe.py        # 播音探针(测试辅助)
-    └── screenshot.py         # 纯 ctypes 截屏(全屏/PrintWindow 窗口)
 └── tools/
+    ├── build_exe.py          # 打包成单文件 exe
+    ├── make_icon.py          # 重新生成图标(多尺寸 png + ico)
+    ├── WindowHide.manifest   # exe 清单(asInvoker,不默认要管理员)
     ├── rescue_window.bat     # 急救:把卡在最小化的游戏窗口拉回来(自动提权)
     └── rescue_window.py      #   同上,纯 Python 实现
 ```
 
-### 测试
+### 自测
 
-分两类。**需要真实 Windows 桌面会话的**(隐藏/恢复/静音/热键注入/全屏)在
-CI 里跑不了 —— headless runner 没有交互式桌面,硬塞进去只会常年红灯 ——
-所以 CI 只跑纯逻辑那部分,其余请在本机手动跑。
-
-```bash
-# 纯逻辑(无窗口、无桌面,CI 会跑):分类/匹配/配置/热键文案
-python tests/logic_test.py
-
-# 以下都需要真实桌面
-python tests/smoke_test.py        # 冒烟:枚举/分类/配置/托盘通路
-python tests/integration_test.py  # 集成:测试窗口隐藏恢复 + 托盘移除恢复 + 热键
-python tests/audio_test.py        # 静音:播音探针静音/取消/状态查询
-python tests/audio_tree_test.py   # 进程树静音:父进程无会话、子进程播音(模拟浏览器)
-python tests/tray_click_test.py   # 托盘点击切换链路(进程内真实界面)
-python tests/checkbox_test.py     # 勾选行为:跨刷新保留 + 双击不误隐藏 + 全选切换
-python tests/hang_test.py         # 无响应窗口不阻塞(挂起探针)
-python tests/hung_test.py         # 无响应目标:调用立即返回、不碰它、如实提示
-python tests/hotkey_rereg_test.py # 热键重复注册:5 连改不静默死亡
-python tests/hide_state_test.py   # 隐藏状态持久化:重启/多实例/过期清理
-python tests/foreground_test.py   # 前台窗口隐藏 core:桌面/任务栏/自身保护
-python tests/fullscreen_test.py   # 全屏窗口:判定/先最小化再隐藏/恢复/失败上报/权限预检
-python tests/profile_test.py      # 场景切换/保护名单/规则持续生效/状态落盘(临时 APPDATA)
-python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探测空闲热键按键验证
-```
-
-实测结果(Win11,Python 3.13 + PySide6 6.12,15 个测试全绿):
-
-| 测试 | 结果 |
-| --- | --- |
-| 纯逻辑(分类/匹配/配置往返/v1→v2 迁移+备份/场景/保护名单/日志轮转/热键文案) | 70/70 通过 |
-| 冒烟(枚举/分类/配置/托盘通路自检) | 全部通过 |
-| 集成(隐藏/恢复/样式还原/托盘删除与重注册/热键链路) | 12/12 通过 |
-| 静音(静音→取消→状态查询,连跑 3 次稳定) | 全部通过 |
-| 进程树静音(父无会话/子播音,浏览器架构) | 全部通过 |
-| 托盘点击切换(曾因漏导入失效,现有回归测试) | 全部通过 |
-| 勾选行为(跨刷新保留/双击不误隐藏/全选切换/消失清理) | 全部通过 |
-| 无响应窗口不阻塞 | 全部通过 |
-| 无响应目标(调用立即返回/完全不碰它/hung 提示/慢窗口缓存/对照组仍能隐藏) | 14/14 通过 |
-| 热键重复注册(5 连改设置) | 全部通过 |
-| 隐藏状态持久化(重启/多实例/死进程清理) | 全部通过 |
-| 前台窗口隐藏 core(桌面/任务栏/自身保护/定向恢复) | 12/12 通过 |
-| 全屏窗口(判定/默认不最小化/强制策略/恢复/失败上报/权限预检/回滚) | 26/26 通过 |
-| 场景(切换藏/放/手动藏不被动/静音/保护名单/规则持续生效/状态落盘) | 20/20 通过 |
-| GUI 端到端(热键 Ctrl+Alt+F8 切换隐藏/恢复) | 通过 |
-
-集成测试会真实操作桌面(自动启动/关闭测试窗口与探针),结束时会恢复原状,
-不影响正在使用的程序。热键一节分两步验证:先向热键消息窗口 post 一条
-**伪造的 WM_HOTKEY** 确定性地走通"消息循环→wndproc→信号→主线程"链路;
-再尝试 keybd_event 真实注入 —— 部分环境(如沙箱)会整体拦截合成输入,
-此时用临时装的 **LL 键盘钩子**做 OS 层旁证:钩子没看到注入事件则记 SKIP
-(环境限制,非代码回归),看到了却没触发才判 FAIL。
-
-静音测试的两个环境坑(都已处理,非代码问题):① 探针先写 pid 再播音,
-音频会话异步创建,紧接着查会拿到"0 个会话" —— 先轮询等会话出现;
-② Windows 音量合成器**按应用记住静音状态**,上次测试若取消静音失败,
-会给 python.exe 留下静音、新探针生来就是静音的 —— 测试先复位。
-产品侧对应加固:恢复时取消静音带重试(会话可能被系统临时回收),
-否则用户恢复窗口后应用会一直静着。
+作者的回归测试脚本不随仓库发布(它们要真实桌面会话,对使用者也没有意义)。
+如果你想验证改动,直接跑 `run.bat` 手动点一遍最实际。
 
 ### 打包 exe
 
 ```bat
 .venv\Scripts\pip install pyinstaller
 .venv\Scripts\python tools\build_exe.py --clean
-.venv\Scripts\python tests\exe_smoke_test.py   # 验收打包产物
 ```
 
 几个刻意的选择:
@@ -301,17 +226,10 @@ python tests/gui_e2e.py           # GUI 端到端:启动真实程序,自动探�
   150MB+ 压到 46MB。改排除表之后**必须真跑一次 exe** —— 有些模块是被
   Qt 插件反向依赖的,排掉后启动就崩,而打包过程不会有任何提示。
 
-`tests/exe_smoke_test.py` 是打包产物的验收:启动耗时、进程名、图标、
-热键注册、真实隐藏/恢复一个窗口。
-
 ### 更多
 
 技术细节(为什么任务栏会消失、全屏游戏为什么藏不掉、无响应目标怎么防卡死、
 UIPI 权限、托盘图标怎么删)都在 **[docs/DESIGN.md](docs/DESIGN.md)**。
-想自己发版/发新版本:**[docs/GITHUB.md](docs/GITHUB.md)**(建仓库、push、tag、
-Release、CI 是什么,都写了)。
-优化路线见 [docs/ROADMAP.md](docs/ROADMAP.md),需要真人配合的测试清单见
-[docs/MANUAL_TESTS.md](docs/MANUAL_TESTS.md)。
 
 ## 常见问题
 
@@ -340,14 +258,10 @@ Release、CI 是什么,都写了)。
   该程序即可,不影响窗口隐藏/恢复本身。
 - **想开机自启?** 设置 → 行为 → 勾选"开机自动启动"(写当前用户注册表 Run 项,
   不需要管理员)。
-## 开发状态与参与
+## 反馈问题
 
-- 优化路线(含实测数据与验收标准):[`docs/ROADMAP.md`](docs/ROADMAP.md)
-- 需要真人配合的测试清单(游戏全屏、管理员权限、多显示器、长时间挂机):
-  [`docs/MANUAL_TESTS.md`](docs/MANUAL_TESTS.md)
-
-欢迎按测试清单里的步骤回报结果。**报问题时请附** `%APPDATA%\WindowHide\windowhide.log`
-的最后几十行 + 程序名 + 工具当时是否以管理员身份运行 —— 这三样基本就能定位。
+开 issue 就行。**报问题时请附** `%APPDATA%\WindowHide\windowhide.log` 的最后
+几十行 + 程序名 + 工具当时是否以管理员身份运行 —— 这三样基本就能定位。
 ## 边界与免责
 
 这是一个**本机窗口管理工具**,只做三件事:改目标窗口的显示状态、按进程移除
@@ -359,6 +273,7 @@ Release、CI 是什么,都写了)。
 - 请只在**自己有权操作的设备**上使用。拿它偷窥、规避监护或规避审计不在
   支持范围内,也不被作者认可。
 - 隐藏不等于隐身:目标程序仍在运行,任务管理器、资源监视器照样看得见。
+
 ## 许可证
 
 [MIT](LICENSE)
