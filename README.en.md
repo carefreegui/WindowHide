@@ -33,6 +33,12 @@ No DLL injection, no global hooks, no synthetic input: only documented Win32 API
 - **Never hides critical processes** — `dwm.exe`, the IME host
   (`TextInputHost.exe`), the UWP frame host and friends are protected by default
   (you can add your own). Hiding them would break your desktop or your keyboard.
+- **Hides windows, not programs** — five browser windows open and you only want
+  three of them gone? Tick exactly those three. Windows are hidden one `HWND` at a
+  time, so the siblings of a multi-window Chromium/Electron process stay visible and
+  usable. When only part of a program is hidden, its tray icon and its audio are
+  left alone (both are per-process actions). Profiles stay per-program on purpose:
+  switching a profile hides every window of the programs it matches.
 - **Won't hang your desktop** — every cross-process window call runs on a worker
   thread, and windows owned by an unresponsive process are never touched
   (`IsHungAppWindow`). A stuck target can no longer freeze the UI.
@@ -70,6 +76,11 @@ Then:
 2. Press "隐藏勾选" (Hide selected) — they move to the background
 3. Press the global hotkey (default `Ctrl+Alt+H`) or single-click the tray icon to
    bring them back
+
+Ticking is per **window**: for a program with several open windows, only the ticked
+ones are hidden (double-clicking a row toggles that single window). The hotkey and
+the tray click act on the ticked windows; profile rules are only used when nothing
+is ticked.
 
 ## Configuration
 

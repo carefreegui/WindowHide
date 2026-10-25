@@ -76,6 +76,9 @@ class MainWindow(QMainWindow):
         self._btn_hide = QPushButton("隐藏勾选")
         # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
         # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
+        self._btn_hide.setToolTip(
+            "只隐藏勾中的**窗口**。\n"
+            "同一个程序开了多个窗口(浏览器多开)时,没勾的窗口会原样留着。")
         self._btn_restore = QPushButton("恢复")
         self._btn_profile = QPushButton("场景")
         self._btn_profile_menu = QMenu(self._btn_profile)
@@ -253,7 +256,9 @@ class MainWindow(QMainWindow):
         self._controller.toggle(self._current_targets())
 
     def _toggle_hwnd(self, hwnd: int) -> None:
-        if self._controller.is_hwnd_hidden(hwnd):
+        # 用"已隐藏或正在隐藏"判断,别用纯状态:隐藏是异步的,双击的
+        # 第二下若赶在落地之前,会看到"还没藏"从而再藏一次(点了恢复没反应)
+        if self._controller.is_hwnd_hidden_or_pending(hwnd):
             self._controller.restore_hwnd(hwnd)
         else:
             self._controller.hide_hwnds([hwnd])
@@ -423,13 +428,23 @@ class MainWindow(QMainWindow):
             return
         self.refresh()
         if action == "hidden":
-            write(f"隐藏 {count} 个程序(转入后台)")
+            # 计数改成**窗口**数:隐藏现在是可以只藏同一个程序里的一部分
+            # 窗口的,"N 个程序"会让用户以为整个程序都被收起来了
+            n_win, n_proc = self._controller.hidden_summary()
+            write(f"隐藏 {count} 处(当前共 {n_win} 个窗口 / {n_proc} 个程序)")
             if self._config.show_balloon:
-                self._tray.showMessage("已隐藏", f"{count} 个程序已转入后台,任务栏与托盘图标已隐藏")
+                self._tray.showMessage(
+                    "已隐藏",
+                    f"已隐藏 {n_win} 个窗口(涉及 {n_proc} 个程序),"
+                    "任务栏与托盘图标已隐藏")
         elif action == "restored":
-            write(f"恢复 {count} 个程序")
+            n_win, n_proc = self._controller.hidden_summary()
+            write(f"恢复 {count} 处(剩余 {n_win} 个窗口 / {n_proc} 个程序)")
             if self._config.show_balloon:
-                self._tray.showMessage("已恢复", f"{count} 个程序已恢复显示")
+                self._tray.showMessage(
+                    "已恢复",
+                    "窗口已全部恢复显示" if n_win == 0
+                    else f"已恢复;仍有 {n_win} 个窗口处于隐藏状态")
 
     def _on_profile_changed(self, name: str) -> None:
         self.refresh()
