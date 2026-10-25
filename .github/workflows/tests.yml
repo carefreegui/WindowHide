@@ -14,6 +14,10 @@ jobs:
     # 硬塞进去只会让 CI 变成常年红灯的摆设。
     name: logic (windows)
     runs-on: windows-latest
+    env:
+      # runner 默认 cp1252 控制台,测试里有中文输出会直接崩;强制 UTF-8
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     strategy:
       fail-fast: false
       matrix:

@@ -16,6 +16,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# 这个测试要进 CI。GitHub 的 Windows runner 控制台默认是 cp1252,
+# 打中文会直接 UnicodeEncodeError 崩在第一个 print 上(实测)。
+# 强制 UTF-8 输出,本地/CI 行为一致。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from windowhide.config import (  # noqa: E402
