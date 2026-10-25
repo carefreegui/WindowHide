@@ -184,6 +184,17 @@ class HideController(QObject):
                 out.update(hp.records.keys())
         return out
 
+    def pending_hwnds(self) -> set[int]:
+        """正在隐藏/恢复途中、还没落地的窗口。
+
+        界面刷新要靠它兜一下:异步隐藏投递出去之后,窗口已经"不可见"了,
+        但还没写进 `_hidden` —— 这一小段里枚举不到、隐藏记录里也没有,
+        列表会把它当成"窗口消失了"直接从表里删掉,连带勾选状态一起丢
+        (用户实测:"多按几次快捷键,勾选自己就没了")。
+        """
+        with self._lock:
+            return set(self._pending_hwnd.keys())
+
     def is_pid_hidden(self, pid: int) -> bool:
         with self._lock:
             return pid in self._hidden
@@ -217,6 +228,19 @@ class HideController(QObject):
         with self._lock:
             return (len(self._hidden),
                     sum(hp.window_count for hp in self._hidden.values()))
+
+    def partially_muted(self) -> list[str]:
+        """"只藏了一部分窗口、却把整个程序静音了"的程序名。
+
+        这种情况用户几乎一定会踩:他只是想藏一个浏览器窗口,结果同程序还
+        开着的那几个也没声了。静音是整进程级的,没有别的做法,所以至少在
+        状态栏说一句,告诉他在哪豁免。
+        """
+        with self._lock:
+            names = [hp.process_name for hp in self._hidden.values()
+                     if hp.partial and hp.muted
+                     and not self._settings.keeps_audio(hp.process_name)]
+        return list(dict.fromkeys(names))
 
     # ------------------------------------------------------------ 工作线程
     def _submit(self, fn, *args) -> bool:

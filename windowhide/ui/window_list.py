@@ -174,6 +174,10 @@ class WindowTable(QTableWidget):
         if keep_audio is not None:
             self._keep_audio = {p.lower() for p in keep_audio}
         self._mute_global = mute_global
+        # 只清理**真的没了**的窗口(进程退出/窗口销毁)。窗口暂时不在列表里
+        # (被搜索框过滤、异步隐藏还没落地)不算消失,勾选要留着 ——
+        # 用户实测:"多按几次隐藏快捷键,勾选自己就没了,然后再按就认不出来"。
+        self._checked = {h for h in self._checked if win32.IsWindow(h)}
 
         self._syncing = True
         try:
@@ -188,15 +192,15 @@ class WindowTable(QTableWidget):
         self.setRowCount(0)
         self._hwnds = []
         self._procs = []
-        self._checked = set()
+        # 注意:**不要**在这里把 _checked 重建一遍。它按 hwnd 保存,是勾选
+        # 状态的唯一真相;照界面行去推导的话,"这一刻不在列表里的窗口"的
+        # 勾选会被静默抹掉(异步隐藏的空窗期、搜索框过滤都会命中)。
         for win in sorted(windows, key=lambda w: (w.process_name.lower(), w.title.lower())):
             row = self.rowCount()
             self.insertRow(row)
             self._hwnds.append(win.hwnd)
             self._procs.append(win.process_name or "")
-            checked = win.hwnd in old_checked
-            if checked:
-                self._checked.add(win.hwnd)
+            checked = win.hwnd in self._checked
 
             # 勾选
             chk = QTableWidgetItem()
@@ -281,14 +285,32 @@ class WindowTable(QTableWidget):
         return classify_window(win)
 
     def checked_hwnds(self) -> list[int]:
-        out = []
+        """勾中的窗口。
+
+        以 `_checked` 为准(而不是只看当前可见的行):窗口可能因为异步隐藏
+        还没落地、或者被搜索框过滤掉而不在表里,行没了不代表用户没勾它。
+        已经销毁的窗口在这里顺手剔掉。
+        """
+        out: list[int] = []
+        seen: set[int] = set()
         for row in range(self.rowCount()):
             item = self.item(row, COL_CHECK)
             if item and item.checkState() == Qt.Checked:
-                out.append(self._hwnds[row])
+                hwnd = self._hwnds[row]
+                if hwnd not in seen and win32.IsWindow(hwnd):
+                    seen.add(hwnd)
+                    out.append(hwnd)
+        for hwnd in sorted(self._checked):
+            if hwnd not in seen and win32.IsWindow(hwnd):
+                seen.add(hwnd)
+                out.append(hwnd)
         return out
 
     def set_all_checked(self, checked: bool) -> None:
+        if not checked:
+            # "取消全选"就是一律不选 —— 连当前不在列表里的勾选一起清掉,
+            # 否则会出现"点了取消全选,按隐藏还是藏了一批"的怪事
+            self._checked.clear()
         for row in range(self.rowCount()):
             item = self.item(row, COL_CHECK)
             if item and (item.flags() & Qt.ItemIsEnabled):

@@ -139,6 +139,9 @@ class MainWindow(QMainWindow):
     def refresh(self) -> None:
         our_pid = win32.get_window_pid(int(self.winId()))
         hidden = self._controller.hidden_hwnds()
+        # 在途的窗口也要算"留着":异步隐藏的真空期里它既不可见、也还没进
+        # 隐藏记录,不兜这一下,列表会把它删掉,连勾选一起没了。
+        alive = hidden | self._controller.pending_hwnds()
         try:
             windows = win32.enum_top_level_windows()
         except Exception:
@@ -146,7 +149,7 @@ class MainWindow(QMainWindow):
         # 可见窗口 + 被本工具隐藏的窗口(后者要在列表里显示"已隐藏")
         self._windows = [w for w in windows
                          if w.pid != our_pid
-                         and (w.visible or w.hwnd in hidden)
+                         and (w.visible or w.hwnd in alive)
                          # 桌面/任务栏(explorer 的 Progman/Shell_TrayWnd)
                          # 一律不列 —— 它们混进来就等于给了用户一个
                          # "一键把桌面藏了"的按钮
@@ -459,6 +462,14 @@ class MainWindow(QMainWindow):
                     "已隐藏",
                     f"已隐藏 {n_win} 个窗口(涉及 {n_proc} 个程序),"
                     "任务栏与托盘图标已隐藏")
+            # 只藏了一部分窗口却把整个程序静音了 —— 这类"意料之外的连带
+            # 影响"必须说出来,不然用户只会觉得工具坏了
+            muted = self._controller.partially_muted()
+            if muted:
+                self.statusBar().showMessage(
+                    "提示:" + "、".join(muted) + " 还有窗口在显示,"
+                    "但声音被整个程序静音了(声音只能按程序关)—— "
+                    "不想这样就到「声音」列勾上它")
         elif action == "restored":
             n_win, n_proc = self._controller.hidden_summary()
             write(f"恢复 {count} 处(剩余 {n_win} 个窗口 / {n_proc} 个程序)")
