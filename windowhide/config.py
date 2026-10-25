@@ -119,6 +119,32 @@ class Config:
     # 永不隐藏的额外进程(内置名单在 core/protect.py,这里只放用户自定义)
     protected_processes: list[str] = field(default_factory=list)
 
+    # 「藏了继续响」的进程名(小写):隐藏时**不静音**,声音继续放。
+    # 静音是整进程级的(系统音量合成器按进程/进程树算),所以这件事只能
+    # 按程序定,不能按窗口定 —— 主界面「声音」列就是在改这个表。
+    keep_audio_processes: list[str] = field(default_factory=list)
+
+    # ---------------------------------------------------------------- 声音
+    def keeps_audio(self, process_name: str) -> bool:
+        """这个程序隐藏时是否要继续出声。"""
+        name = (process_name or "").strip().lower()
+        return bool(name) and name in {p.lower() for p in self.keep_audio_processes}
+
+    def set_keeps_audio(self, process_name: str, keep: bool) -> bool:
+        """设置某个程序"藏了继续响",返回是否真的改了。"""
+        name = (process_name or "").strip().lower()
+        if not name:
+            return False
+        current = {p.lower() for p in self.keep_audio_processes}
+        if keep and name not in current:
+            self.keep_audio_processes.append(name)
+            return True
+        if not keep and name in current:
+            self.keep_audio_processes = [
+                p for p in self.keep_audio_processes if p.lower() != name]
+            return True
+        return False
+
     # ---------------------------------------------------------------- 场景
     def profile_names(self) -> list[str]:
         return [p.name for p in self.profiles]
@@ -183,6 +209,7 @@ class Config:
             "profiles": [p.to_dict() for p in self.profiles],
             "active_profile": self.active_profile,
             "protected_processes": list(self.protected_processes),
+            "keep_audio_processes": list(self.keep_audio_processes),
         }
 
     @classmethod
@@ -240,6 +267,10 @@ class Config:
         extra = d.get("protected_processes")
         c.protected_processes = [x for x in extra if isinstance(x, str) and x.strip()] \
             if isinstance(extra, list) else []
+        keep = d.get("keep_audio_processes")
+        c.keep_audio_processes = [x.strip().lower() for x in keep
+                                  if isinstance(x, str) and x.strip()] \
+            if isinstance(keep, list) else []
         return c
 
     def save(self) -> None:

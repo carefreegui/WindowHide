@@ -556,20 +556,25 @@ class HideController(QObject):
         if failed:
             from ..log import write
             write(f"未能隐藏的窗口:{name}(pid={pid}) 失败 {failed}/{len(records)} 个")
-        if partial:
-            # 托盘图标和静音都是**整进程级**的:只藏了一半窗口时动它们,
-            # 会连带影响用户还想继续用的那个窗口(浏览器托盘图标消失、
-            # 另一个窗口的网页突然没声音),所以这一类动作全部跳过。
-            if mute or self._settings.mute_on_hide:
-                from ..log import write
-                write(f"{name} 还有别的窗口在显示,跳过静音(静音是整进程级的)")
-            return hp
-        # 托盘图标
-        delete_process_tray_icons(pid)
-        # 静音(场景自带的静音优先,否则看全局设置)
-        if mute or self._settings.mute_on_hide:
+        # 托盘图标和静音都是**整进程级**的,处置方式不一样:
+        # - 托盘图标只在整个进程都藏干净时删。只藏一半还删图标,用户看到的是
+        #   "浏览器明明还在,托盘图标没了" —— 而且不给恢复指令就回不来;
+        # - 静音照做(用户默认期望"藏了就安静"),代价是同程序没藏的窗口也会
+        #   一起没声。要保留声音,就在主界面「声音」列勾上「藏了继续响」。
+        keep_audio = self._settings.keeps_audio(name)
+        want_mute = (not keep_audio) and bool(mute or self._settings.mute_on_hide)
+        if not partial:
+            delete_process_tray_icons(pid)
+        if want_mute:
             n = set_process_mute(pid, True)
             hp.muted = n > 0
+            if partial:
+                from ..log import write
+                write(f"{name} 只藏了一部分窗口,静音连带未隐藏的窗口一起没声"
+                      "(想保留声音:主界面「声音」列勾「藏了继续响」)")
+        elif keep_audio and (mute or self._settings.mute_on_hide):
+            from ..log import write
+            write(f"{name} 在「藏了继续响」名单里,隐藏时不静音")
         return hp
 
     # ------------------------------------------------------------ 恢复
@@ -645,19 +650,29 @@ class HideController(QObject):
 
     def _finish_release(self, hp: HiddenProcess, main_hwnd: int = 0) -> None:
         """整进程放回后的收尾:取消静音、叫回托盘图标、拉前台。"""
-        if hp.muted:
-            # 音频会话可能被系统临时回收后再重建(播音循环重启时尤其明显),
-            # 瞬间取消静音会影响 0 个会话 —— 重试几次,否则用户恢复窗口后
-            # 应用一直处于静音状态(实测踩坑)。
-            for _ in range(5):
-                if set_process_mute(hp.pid, False) > 0:
-                    break
-                time.sleep(0.2)
+        self._unmute(hp)
         request_tray_icon_restore(hp.pid)
         if main_hwnd and self._settings.activate_on_restore:
             # 全屏游戏光 SetForegroundWindow 常常抢不到前台(前台锁),
             # 必须走 AttachThreadInput 那条路,否则游戏回来了但停在后台
             win32.force_foreground(main_hwnd)
+
+    def _unmute(self, hp: HiddenProcess) -> None:
+        """取消这个程序(整个进程树)的静音。
+
+        静音是整进程级的,所以**放出任何一个窗口**就该把声音还回来 ——
+        否则用户把正在听的那个窗口点回来,却是没声的。
+        """
+        if not hp.muted:
+            return
+        # 音频会话可能被系统临时回收后再重建(播音循环重启时尤其明显),
+        # 瞬间取消静音会影响 0 个会话 —— 重试几次,否则用户恢复窗口后
+        # 应用一直处于静音状态(实测踩坑)。
+        for _ in range(5):
+            if set_process_mute(hp.pid, False) > 0:
+                break
+            time.sleep(0.2)
+        hp.muted = False
 
     def restore_hwnds(self, hwnds: list[int], wait: bool = False) -> int:
         """只恢复这几个窗口 —— 同一进程的其它隐藏窗口继续保持隐藏。
@@ -716,7 +731,9 @@ class HideController(QObject):
                     released = not hp.records
                     if released:
                         self._hidden.pop(hp.pid, None)
-                # 只有整个进程都放回来时才动托盘图标 / 音频 ——
+                # 静音是整进程级的:放出任何一个窗口,声音就该回来
+                self._unmute(hp)
+                # 只有整个进程都放回来时才动托盘图标 ——
                 # 还有窗口藏着的时候恢复托盘图标等于自己暴露了
                 if released:
                     self._finish_release(hp, main_hwnd)
@@ -734,6 +751,51 @@ class HideController(QObject):
     def restore_hwnd(self, hwnd: int, wait: bool = False) -> bool:
         """恢复单个窗口(同进程其它隐藏窗口不受影响)。"""
         return self.restore_hwnds([hwnd], wait=wait) > 0
+
+    def set_audio_policy(self, process_name: str, keep_audio: bool) -> int:
+        """「藏了继续响」改了之后,对**已经在隐藏中**的程序立刻生效。
+
+        否则用户勾上"继续响"却发现音乐还是没声,只能先恢复再藏一次 ——
+        而"恢复再藏"会把窗口弹到前台,正是他想避免的事。
+        返回受影响(正在隐藏中)的程序数。
+        """
+        name = (process_name or "").strip().lower()
+        if not name:
+            return 0
+        with self._lock:
+            targets = [hp.pid for hp in self._hidden.values()
+                       if (hp.process_name or "").lower() == name]
+        if not targets:
+            return 0
+
+        def want_mute(pid: int) -> bool:
+            if keep_audio:
+                return False
+            with self._lock:
+                hp = self._hidden.get(pid)
+            prof = self._settings.profile(hp.profile) if (hp and hp.profile) else None
+            return bool(self._settings.mute_on_hide or (prof and prof.mute))
+
+        def run():
+            for pid in targets:
+                target = want_mute(pid)
+                if target:
+                    n = set_process_mute(pid, True)
+                    with self._lock:
+                        hp = self._hidden.get(pid)
+                        if hp is not None:
+                            hp.muted = hp.muted or n > 0
+                else:
+                    set_process_mute(pid, False)
+                    with self._lock:
+                        hp = self._hidden.get(pid)
+                        if hp is not None:
+                            hp.muted = False
+            self._save_state()
+            self.state_changed.emit()
+
+        self._submit(run)
+        return len(targets)
 
     # ------------------------------------------------------------ 切换
     def toggle(self, hwnds: list[int]) -> str:

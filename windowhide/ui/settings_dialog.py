@@ -108,6 +108,10 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(w)
 
         self._cb_mute = QCheckBox("隐藏时同时静音目标程序(恢复时取消静音)")
+        self._cb_mute.setToolTip(
+            "按程序(mute 整条音轨)静音,恢复时取消。\n"
+            "个别程序想让它在后台继续响(比如音乐播放器),"
+            "在主界面「声音」列勾上「藏了继续响」即可单独豁免。")
         self._cb_keep = QCheckBox("隐藏期间自动隐藏新弹出的窗口(持续隐藏)")
         self._cb_activate = QCheckBox("恢复时把主窗口带到前台")
         self._cb_tray = QCheckBox("关闭主界面时最小化到系统托盘(不退出)")
@@ -163,7 +167,11 @@ class SettingsDialog(QDialog):
         v.addWidget(guard)
 
         note = QLabel("静音功能调用系统音量合成器接口,只影响目标程序的声音,"
-                      "不影响其它程序和系统音量。")
+                      "不影响其它程序和系统音量。\n"
+                      "注意:声音是按程序算的,同一个程序开了多个窗口时"
+                      "只有一路声音 —— 藏其中一个窗口并静音,同程序其它窗口"
+                      "也会一起没声;想让某个程序隐藏后继续响,"
+                      "在主界面「声音」列勾选它。")
         note.setWordWrap(True)
         note.setStyleSheet("color: #64748b;")
         v.addWidget(note)

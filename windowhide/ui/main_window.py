@@ -77,8 +77,9 @@ class MainWindow(QMainWindow):
         # 注意:不要设 setDefault(True) —— 默认按钮会在搜索框按回车时
         # 触发"隐藏勾选",误隐藏后果严重(曾按用户反馈踩坑)
         self._btn_hide.setToolTip(
-            "只隐藏勾中的**窗口**。\n"
-            "同一个程序开了多个窗口(浏览器多开)时,没勾的窗口会原样留着。")
+            "只隐藏勾中的窗口。\n"
+            "同一个程序开了多个窗口(浏览器多开)时,没勾的窗口会原样留着。\n"
+            "「声音」列决定这个程序被藏起来后还要不要出声。")
         self._btn_restore = QPushButton("恢复")
         self._btn_profile = QPushButton("场景")
         self._btn_profile_menu = QMenu(self._btn_profile)
@@ -115,6 +116,7 @@ class MainWindow(QMainWindow):
         self._search.textChanged.connect(self._apply_filter)
         self._type_filter.currentIndexChanged.connect(self._apply_filter)
         self._table.row_activated.connect(self._toggle_hwnd)
+        self._table.sound_toggled.connect(self._on_sound_toggled)
 
         self._controller.state_changed.connect(self.refresh)
         self._controller.action_done.connect(self._on_action)
@@ -177,7 +179,9 @@ class MainWindow(QMainWindow):
         our_pid = win32.get_window_pid(int(self.winId()))
         self._table.refresh(self._filtered_windows(),
                             self._controller.hidden_hwnds(), our_pid,
-                            getattr(self, "_protected", set()))
+                            getattr(self, "_protected", set()),
+                            keep_audio=set(self._config.keep_audio_processes),
+                            mute_global=self._config.mute_on_hide)
 
     def _update_status(self) -> None:
         n_proc, n_win = self._controller.hidden_summary()
@@ -262,6 +266,24 @@ class MainWindow(QMainWindow):
             self._controller.restore_hwnd(hwnd)
         else:
             self._controller.hide_hwnds([hwnd])
+
+    def _on_sound_toggled(self, process_name: str, keep: bool) -> None:
+        """「声音」列:这个程序被隐藏时要不要继续出声。
+
+        为什么只能按程序设:系统音量合成器的会话是挂在**进程**上的,
+        同一个程序的多个窗口共用一路声音 —— 想让"这一个窗口静音、另一个
+        继续响"在 Windows 上做不到。所以这一列是程序级开关,同一程序的
+        所有行联动。
+        """
+        if self._config.set_keeps_audio(process_name, keep):
+            self._config.save()
+        n = self._controller.set_audio_policy(process_name, keep)
+        msg = (f"{process_name}:隐藏时继续播放声音"
+               if keep else f"{process_name}:隐藏时跟随全局静音设置")
+        if n:
+            msg += f"(已对隐藏中的 {n} 个窗口立即生效)"
+        self.statusBar().showMessage(msg)
+        self._update_status()
 
     def _hide_self(self) -> None:
         """把本工具主窗口收进托盘(与点叉号等效)。
