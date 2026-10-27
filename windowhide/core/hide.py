@@ -1115,12 +1115,19 @@ class HideController(QObject):
                 self._retry[hwnd] = self._retry.get(hwnd, 0) + 1
             with self._lock:
                 rec = hp.records.get(hwnd)
+                # **只在没有记录时补一条**,绝不覆盖已有的 —— 这是"藏一下窗口
+                # 尺寸就变了"的元凶:
+                # - 补刀时窗口往往是**程序自己弹出来的**普通窗口(Chromium
+                #   恢复会话、微信被消息唤起…),它的 show_cmd 是 SW_SHOWNORMAL;
+                #   覆盖掉之后,原本记着"最大化"的窗口恢复回来就成了小窗口;
+                # - 如果补刀时窗口还藏着,hide_window 读到的 show_cmd 是
+                #   SW_HIDE(0),restore_window 又会把 0 映射成 SW_SHOWNORMAL,
+                #   一样是小窗口;
+                # - 覆盖 ex_style 更糟:那会儿我们刚加过 WS_EX_TOOLWINDOW,
+                #   记成"原始样式"就等于永远去不掉了。
+                # records 里存的是**用户按下隐藏那一刻**的状态,那才是恢复目标。
                 if rec is None:
                     hp.records[hwnd] = WindowRecord(hwnd, ex_style, show_cmd,
                                                     "", fullscreen)
-                else:
-                    rec.ex_style = ex_style
-                    rec.show_cmd = show_cmd
-                    rec.fullscreen = fullscreen
             self._save_state()
         self.state_changed.emit()

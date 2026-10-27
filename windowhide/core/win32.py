@@ -484,12 +484,34 @@ def get_window_styles(hwnd: int) -> tuple[int, int]:
     return GetWindowLongPtrW(hwnd, GWL_STYLE), GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
 
 
+def is_maximized(hwnd: int) -> bool:
+    """窗口是不是**真的**最大化(`IsZoomed`,看 WS_MAXIMIZE 位)。
+
+    不能拿 `GetWindowPlacement().showCmd` 当唯一判据:自绘标题栏 / 伪最大化
+    的程序(Chromium 系、部分 Qt 程序)会给出 SW_SHOWNORMAL 却把窗口铺满
+    屏幕;反过来,窗口一旦被隐藏,showCmd 又会变成 SW_HIDE。两种都会让
+    "恢复"把最大化弄丢。
+    """
+    if not IsWindow(hwnd):
+        return False
+    try:
+        return bool(user32.IsZoomed(wintypes.HWND(hwnd)))
+    except Exception:
+        return False
+
+
 def get_window_placement_cmd(hwnd: int) -> int:
     wp = WINDOWPLACEMENT()
     wp.length = ctypes.sizeof(WINDOWPLACEMENT)
-    if GetWindowPlacement(hwnd, ctypes.byref(wp)):
-        return int(wp.showCmd)
-    return SW_SHOWNORMAL
+    if not GetWindowPlacement(hwnd, ctypes.byref(wp)):
+        return SW_SHOWNORMAL
+    cmd = int(wp.showCmd)
+    # 隐藏 / 最小化状态下 IsZoomed 一定是 False,别把这些状态改写成最大化
+    if cmd in (SW_HIDE, SW_SHOWMINIMIZED, SW_MINIMIZE, SW_SHOWMINNOACTIVE):
+        return cmd
+    # 可见状态下以 IsZoomed 为准:showCmd 说"普通"但窗口其实占满屏幕的,
+    # 记成普通的话恢复时就缩回去了(用户实测"藏一下最大化就没了")
+    return SW_SHOWMAXIMIZED if is_maximized(hwnd) else cmd
 
 
 def get_window_rect(hwnd: int) -> tuple[int, int, int, int]:
@@ -945,6 +967,7 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
         # SetWindowPlacement 直接改状态:被最小化的全屏游戏对
         # ShowWindow(SW_SHOWNORMAL) 可能毫无反应(实测永劫无间)。
         if set_placement_cmd(hwnd, cmd):
+            _ensure_maximized(hwnd, cmd)
             return
     # 目标未响应 / 改状态失败:只能投递异步请求,绝不在这里等
     ShowWindowAsync(hwnd, cmd)
@@ -955,6 +978,27 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
 
 def is_hidden(hwnd: int) -> bool:
     return not IsWindowVisible(hwnd)
+
+
+def _ensure_maximized(hwnd: int, cmd: int, timeout: float = 0.3) -> None:
+    """记录的是最大化,恢复后却没最大化 —— 补一刀。
+
+    `SetWindowPlacement(SW_SHOWMAXIMIZED)` 偶尔不落地:目标程序会在
+    `WM_WINDOWPOSCHANGING` 里把自己的 bounds 改回去(Chromium 系常见),
+    于是窗口回来是"普通大小但占满过屏幕前的样子"。用户看到的只是
+    "藏一下,窗口尺寸就变了",完全无从排查 —— 所以不靠这一层运气。
+    """
+    if cmd != SW_SHOWMAXIMIZED or not IsWindow(hwnd):
+        return
+    if is_maximized(hwnd):
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.03)
+        if is_maximized(hwnd):
+            return
+    if not is_hung(hwnd):
+        ShowWindowAsync(hwnd, SW_SHOWMAXIMIZED)
 
 
 # ---------------------------------------------------------------- 图标
