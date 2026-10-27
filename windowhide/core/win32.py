@@ -594,6 +594,7 @@ def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
     """
     result: list[WindowInfo] = []
     names: dict[int, str] = {}
+    paths: dict[int, str] = {}
 
     @WNDENUMPROC
     def _cb(hwnd, _lparam):
@@ -608,8 +609,11 @@ def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
         try:
             style, ex_style = get_window_styles(hwnd)
             title = get_window_text(hwnd)
-            if wpid not in names:
-                names[wpid] = process_image_path(wpid).rsplit("\\", 1)[-1]
+            if wpid not in paths:
+                # 全路径留着:分类要靠它的「文件说明」认微信/QQ 这类改了进程名
+                # 的程序(见 classify.py)。同一 pid 只查一次。
+                paths[wpid] = process_image_path(wpid)
+                names[wpid] = paths[wpid].rsplit("\\", 1)[-1]
             result.append(WindowInfo(
                 hwnd=int(hwnd),
                 pid=wpid,
@@ -621,6 +625,7 @@ def enum_top_level_windows(pid: int | None = None) -> list[WindowInfo]:
                 style=style,
                 rect=get_window_rect(hwnd),
                 process_name=names[wpid],
+                process_path=paths[wpid],
                 # 界面上要能看出"这窗口无响应",否则用户只会看到标题空着,
                 # 以为是工具没刷新出来。
                 # 只在"标题取不到"时才问内核:有标题就说明它活着,而
@@ -1003,3 +1008,85 @@ def file_icon_handle(path: str, big: bool = True) -> int:
     flags = SHGFI_ICON | (SHGFI_LARGEICON if big else SHGFI_SMALLICON)
     ok = SHGetFileInfoW(path, 0, ctypes.byref(info), ctypes.sizeof(info), flags)
     return int(info.hIcon) if ok else 0
+
+
+# ---------------------------------------------------------------- 文件说明
+# 进程名靠不住:微信 4.x 把 WeChat.exe 改名成了 Weixin.exe;企业微信是
+# WXWork.exe;QQ 系一堆 QQMusic/QQBrowser/QQGame 共享前缀。真正给人看的
+# 是 exe 版本资源里的「文件说明」(资源管理器 属性 → 详细信息 那一栏)。
+# 读它只是解析磁盘上的字符串资源,不加载目标进程、不碰内存。
+version = ctypes.WinDLL("version", use_last_error=True)
+
+_GetFileVersionInfoSizeW = version.GetFileVersionInfoSizeW
+_GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR,
+                                     ctypes.POINTER(wintypes.DWORD)]
+_GetFileVersionInfoSizeW.restype = wintypes.DWORD
+
+_GetFileVersionInfoW = version.GetFileVersionInfoW
+_GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                 wintypes.DWORD, ctypes.c_void_p]
+_GetFileVersionInfoW.restype = wintypes.BOOL
+
+_VerQueryValueW = version.VerQueryValueW
+_VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                            ctypes.POINTER(ctypes.c_void_p),
+                            ctypes.POINTER(wintypes.UINT)]
+_VerQueryValueW.restype = wintypes.BOOL
+
+_DESC_CACHE: dict[str, str] = {}
+_DESC_CACHE_MAX = 512
+
+
+def _read_version_strings(path: str) -> dict[str, str]:
+    """一次读出版本资源里的 FileDescription / ProductName。"""
+    size = _GetFileVersionInfoSizeW(path, None)
+    if not size:
+        return {}
+    buf = ctypes.create_string_buffer(size)
+    block = ctypes.cast(buf, ctypes.c_void_p)
+    if not _GetFileVersionInfoW(path, 0, size, block):
+        return {}
+    pv = ctypes.c_void_p()
+    n = wintypes.UINT(0)
+    if not _VerQueryValueW(block, "\\VarFileInfo\\Translation",
+                           ctypes.byref(pv), ctypes.byref(n)) \
+            or not pv.value or n.value < 4:
+        return {}
+    # 一个 exe 可能带多套语言块(中/英/日…),逐个试,谁先有就用谁
+    words = ctypes.cast(pv, ctypes.POINTER(wintypes.WORD))
+    out: dict[str, str] = {}
+    for i in range(n.value // 4):
+        lang, codepage = words[i * 2], words[i * 2 + 1]
+        for key in ("FileDescription", "ProductName"):
+            if out.get(key):
+                continue
+            sub = f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{key}"
+            sp = ctypes.c_void_p()
+            sn = wintypes.UINT(0)
+            if _VerQueryValueW(block, sub, ctypes.byref(sp),
+                               ctypes.byref(sn)) and sp.value and sn.value:
+                out[key] = ctypes.wstring_at(sp)
+    return out
+
+
+def file_description(path: str) -> str:
+    """exe 的「文件说明」(没有就退回产品名)。取不到返回 ""。
+
+    结果按路径缓存 —— 列表每 1.5 秒重建一次,每次都读磁盘会明显拖慢枚举。
+    """
+    if not path:
+        return ""
+    key = path.lower()
+    if key in _DESC_CACHE:
+        return _DESC_CACHE[key]
+    info = _read_version_strings(path)
+    text = " ".join((info.get("FileDescription")
+                     or info.get("ProductName") or "").split())
+    if len(_DESC_CACHE) >= _DESC_CACHE_MAX:
+        _DESC_CACHE.clear()
+    _DESC_CACHE[key] = text
+    return text
+
+
+def clear_description_cache() -> None:
+    _DESC_CACHE.clear()

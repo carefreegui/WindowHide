@@ -4,6 +4,6 @@
 程序保持后台运行;支持全局快捷键与托盘图标点击恢复。
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 APP_NAME = "WindowHide"
 APP_DISPLAY_NAME = "窗口隐藏工具"

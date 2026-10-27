@@ -26,6 +26,18 @@ MOD_NOREPEAT = 0x4000
 CONFIG_VERSION = 2
 DEFAULT_PROFILE = "默认"
 
+# 场景的静音模式(三态)。见 Profile 的注释 —— 用 bool 就没法表达
+# "这个场景故意不静音",而 bool 的 OR 关系正是三个开关打架的根源。
+MUTE_INHERIT = "inherit"   # 跟随全局设置
+MUTE_ALWAYS = "always"     # 一定静音
+MUTE_NEVER = "never"       # 一定不静音
+MUTE_MODES = (MUTE_INHERIT, MUTE_ALWAYS, MUTE_NEVER)
+MUTE_MODE_LABELS = {
+    MUTE_INHERIT: "跟随全局设置",
+    MUTE_ALWAYS: "总是静音",
+    MUTE_NEVER: "从不静音",
+}
+
 
 @dataclass(slots=True)
 class HotkeySpec:
@@ -46,26 +58,53 @@ class HotkeySpec:
 
 @dataclass(slots=True)
 class Profile:
-    """一个场景:一组目标规则 + 该场景是否顺带静音。"""
+    """一个场景:一组目标规则 + 该场景的静音模式。
+
+    静音模式是三态,不是 bool —— 以前场景只要勾了"顺带静音"就**无条件**
+    压过行为页的全局开关(两者是 OR),用户关掉全局那个、切到场景照样被
+    静音,看着就是"两个开关在打架"。三态把话说清楚:
+    - inherit:跟随全局(设置 → 行为 →「隐藏时同时静音」)
+    - always :这个场景藏东西时一定静音
+    - never  :这个场景藏东西时一定不静音(音乐场景常见)
+    """
     name: str = DEFAULT_PROFILE
     rules: list[TargetRule] = field(default_factory=list)
-    mute: bool = False
+    mute_mode: str = MUTE_INHERIT
+
+    # 兼容旧的布尔写法(配置里的 "mute" 字段、代码里的 profile.mute)。
+    # 只读写 always/inherit 两态;三态交互走 mute_mode。
+    @property
+    def mute(self) -> bool:
+        return self.mute_mode == MUTE_ALWAYS
+
+    @mute.setter
+    def mute(self, value: bool) -> None:
+        if value:
+            self.mute_mode = MUTE_ALWAYS
+        elif self.mute_mode == MUTE_ALWAYS:
+            self.mute_mode = MUTE_INHERIT
 
     def to_dict(self) -> dict:
         return {"name": self.name,
                 "rules": [r.to_dict() for r in self.rules],
+                "mute_mode": self.mute_mode,
+                # 老版本读的是这个布尔值,顺手写一份,手工改配置时也直观
                 "mute": self.mute}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Profile":
         name = d.get("name")
         rules = d.get("rules")
-        mute = d.get("mute")
+        mode = d.get("mute_mode")
+        if mode not in (MUTE_INHERIT, MUTE_ALWAYS, MUTE_NEVER):
+            # v2 早期版本只有 bool: true 等价于"总是静音",
+            # false 等价于"跟随全局"(不是"从不静音",那样会改变老配置的行为)
+            mode = MUTE_ALWAYS if d.get("mute") is True else MUTE_INHERIT
         return cls(
             name=name.strip() if isinstance(name, str) and name.strip() else DEFAULT_PROFILE,
             rules=[TargetRule.from_dict(r) for r in rules if isinstance(r, dict)]
             if isinstance(rules, list) else [],
-            mute=mute if isinstance(mute, bool) else False,
+            mute_mode=mode,
         )
 
 

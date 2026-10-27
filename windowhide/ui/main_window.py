@@ -178,13 +178,26 @@ class MainWindow(QMainWindow):
             out.append(w)
         return out
 
+    def _mute_reasons(self) -> dict[str, tuple[bool, str]]:
+        """给「声音」列准备"藏了会不会静音 + 为什么"。
+
+        这里问的是**现在**的判定,所以已经藏着的程序要按它当初被哪个场景
+        藏的来算,没藏的就按"手动勾选隐藏"算(profile 为空)。
+        """
+        out: dict[str, tuple[bool, str]] = {}
+        for w in self._windows:
+            proc = (w.process_name or "").lower()
+            if proc and proc not in out:
+                out[proc] = self._controller.mute_reason_for(proc)
+        return out
+
     def _apply_filter(self) -> None:
         our_pid = win32.get_window_pid(int(self.winId()))
         self._table.refresh(self._filtered_windows(),
                             self._controller.hidden_hwnds(), our_pid,
                             getattr(self, "_protected", set()),
                             keep_audio=set(self._config.keep_audio_processes),
-                            mute_global=self._config.mute_on_hide)
+                            mute_reasons=self._mute_reasons())
 
     def _update_status(self) -> None:
         n_proc, n_win = self._controller.hidden_summary()

@@ -5,12 +5,14 @@ import copy
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QRadioButton, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QGroupBox,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QScrollArea,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
-from ..config import Config, Profile
+from ..config import (Config, MUTE_ALWAYS, MUTE_INHERIT,
+                      MUTE_MODE_LABELS, MUTE_MODES, Profile)
 from ..core.protect import BUILTIN
 from ..core.targets import TargetRule
 from .hotkey_edit import HotkeyCaptureButton
@@ -28,12 +30,27 @@ class SettingsDialog(QDialog):
         self._build()
 
     # ---------------------------------------------------------------- UI
+    @staticmethod
+    def _scrollable(page: QWidget) -> QScrollArea:
+        """把一页塞进滚动区。
+
+        不是洁癖:说明文字一多,窗口高度不够时 QLabel(wordWrap)会被压到
+        低于自身需要的高度,几行字直接**叠在一起**。滚动区让内容永远拿到
+        它需要的高度,窗口再小也只是出滚动条。
+        """
+        area = QScrollArea()
+        area.setWidget(page)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
+
     def _build(self) -> None:
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._hotkey_tab(), "快捷键")
-        tabs.addTab(self._behavior_tab(), "行为")
-        tabs.addTab(self._targets_tab(), "场景")
+        tabs.addTab(self._scrollable(self._hotkey_tab()), "快捷键")
+        tabs.addTab(self._scrollable(self._behavior_tab()), "行为")
+        tabs.addTab(self._scrollable(self._targets_tab()), "场景")
         layout.addWidget(tabs)
 
         buttons = QHBoxLayout()
@@ -107,11 +124,13 @@ class SettingsDialog(QDialog):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        self._cb_mute = QCheckBox("隐藏时同时静音目标程序(恢复时取消静音)")
+        self._cb_mute = QCheckBox("隐藏时同时静音目标程序(默认行为)")
         self._cb_mute.setToolTip(
-            "按程序(mute 整条音轨)静音,恢复时取消。\n"
-            "个别程序想让它在后台继续响(比如音乐播放器),"
-            "在主界面「声音」列勾上「藏了继续响」即可单独豁免。")
+            "按程序(整条音轨)静音,恢复时取消。这一项是「默认值」:\n"
+            "· 场景页可以给某个场景单独设「总是静音 / 从不静音」,压过它;\n"
+            "· 主界面「声音」列勾了「藏了继续响」的程序,优先级最高。\n"
+            "三处的关系就是这三行,不会再有别的规则。")
+        self._cb_mute.toggled.connect(self._refresh_mute_hint)
         self._cb_keep = QCheckBox("隐藏期间自动隐藏新弹出的窗口(持续隐藏)")
         self._cb_activate = QCheckBox("恢复时把主窗口带到前台")
         self._cb_tray = QCheckBox("关闭主界面时最小化到系统托盘(不退出)")
@@ -166,12 +185,14 @@ class SettingsDialog(QDialog):
         gv.addWidget(gtip)
         v.addWidget(guard)
 
-        note = QLabel("静音功能调用系统音量合成器接口,只影响目标程序的声音,"
-                      "不影响其它程序和系统音量。\n"
-                      "注意:声音是按程序算的,同一个程序开了多个窗口时"
-                      "只有一路声音 —— 藏其中一个窗口并静音,同程序其它窗口"
-                      "也会一起没声;想让某个程序隐藏后继续响,"
-                      "在主界面「声音」列勾选它。")
+        note = QLabel("要不要静音,只按这个顺序判一次(上面的项目优先级最高):\n"
+                      "  1. 主界面「声音」列勾了「藏了继续响」→ 不静音\n"
+                      "  2. 场景页的「总是静音 / 从不静音」→ 听场景的\n"
+                      "  3. 都没说 → 听上面这个「隐藏时同时静音」\n\n"
+                      "静音走系统音量合成器,只影响目标程序,不影响其它程序和"
+                      "系统音量。但声音是按程序算的:同一个程序开多个窗口"
+                      "只有一路声音,藏其中一个窗口并静音,同程序其它窗口"
+                      "也会一起没声 —— 想让它继续响,就在「声音」列勾上它。")
         note.setWordWrap(True)
         note.setStyleSheet("color: #64748b;")
         v.addWidget(note)
@@ -202,9 +223,26 @@ class SettingsDialog(QDialog):
         top.addWidget(btn_del)
         v.addLayout(top)
 
-        self._cb_profile_mute = QCheckBox("启用该场景时顺带静音其中的程序")
-        self._cb_profile_mute.toggled.connect(self._sync_profile_mute)
-        v.addWidget(self._cb_profile_mute)
+        # 静音模式用三态下拉,不用 checkbox —— checkbox 只有"静音/不静音",
+        # 而这里第三态"跟随全局"才是默认,也是唯一能让两处设置不打架的写法。
+        mute_row = QHBoxLayout()
+        mute_row.addWidget(QLabel("启用该场景时,声音"))
+        self._cb_profile_mute = QComboBox()
+        for mode in MUTE_MODES:
+            self._cb_profile_mute.addItem(MUTE_MODE_LABELS[mode], mode)
+        self._cb_profile_mute.setToolTip(
+            "跟随全局设置 = 按 设置→行为 里的「隐藏时同时静音目标程序」来。\n"
+            "总是静音 / 从不静音 = 只对这个场景生效,压过全局那一项。\n\n"
+            "注意:主界面「声音」列勾了「藏了继续响」的程序优先级最高,"
+            "这里选什么都不影响它。")
+        self._cb_profile_mute.currentIndexChanged.connect(self._sync_profile_mute)
+        mute_row.addWidget(self._cb_profile_mute, 1)
+        v.addLayout(mute_row)
+
+        self._lbl_mute_hint = QLabel()
+        self._lbl_mute_hint.setWordWrap(True)
+        self._lbl_mute_hint.setStyleSheet("color: #64748b;")
+        v.addWidget(self._lbl_mute_hint)
 
         v.addWidget(QLabel("该场景的规则(切到该场景时,命中规则的窗口会被隐藏):"))
         self._rules_list = QListWidget()
@@ -238,16 +276,47 @@ class SettingsDialog(QDialog):
         self._rules_list.clear()
         self._cb_profile_mute.setEnabled(p is not None)
         if p is None:
-            self._cb_profile_mute.setChecked(False)
+            self._cb_profile_mute.setCurrentIndex(0)
+            self._lbl_mute_hint.setText("")
             return
         for t in p.rules:
             self._rules_list.addItem(self._rule_text(t))
-        self._cb_profile_mute.setChecked(p.mute)
+        idx = self._cb_profile_mute.findData(p.mute_mode)
+        self._cb_profile_mute.setCurrentIndex(idx if idx >= 0 else 0)
+        self._refresh_mute_hint()
 
-    def _sync_profile_mute(self, checked: bool) -> None:
+    def _refresh_mute_hint(self) -> None:
+        """把"这一项现在到底起不起作用"直接写出来。
+
+        用户报的就是这个:两个地方都能"静音",改了一处没反应,不知道谁说了算。
+        """
+        # 行为页先建、场景页后建,而 _cb_mute.setChecked() 会提前触发 toggled
+        if not hasattr(self, "_lbl_mute_hint") or not hasattr(self, "_profile_box"):
+            return
+        p = self._current_profile()
+        if p is None:
+            self._lbl_mute_hint.setText("")
+            return
+        global_on = self._cb_mute.isChecked() if hasattr(self, "_cb_mute") else False
+        g = "开" if global_on else "关"
+        if p.mute_mode == MUTE_INHERIT:
+            self._lbl_mute_hint.setText(
+                f"全局「隐藏时同时静音」现在是「{g}」—— 这个场景跟着它,"
+                f"所以切过来之后{'会' if global_on else '不会'}静音。")
+        elif p.mute_mode == MUTE_ALWAYS:
+            self._lbl_mute_hint.setText(
+                f"全局那个开关现在是「{g}」,但本场景选了「总是静音」,"
+                f"所以切过来照样静音。")
+        else:
+            self._lbl_mute_hint.setText(
+                f"全局那个开关现在是「{g}」,但本场景选了「从不静音」,"
+                f"所以切过来不会静音。")
+
+    def _sync_profile_mute(self, *_args) -> None:
         p = self._current_profile()
         if p is not None:
-            p.mute = bool(checked)
+            p.mute_mode = self._cb_profile_mute.currentData() or MUTE_INHERIT
+        self._refresh_mute_hint()
 
     def _new_profile(self) -> None:
         name, ok = QInputDialog.getText(self, "新建场景", "场景名称:")

@@ -11,8 +11,11 @@
 再枚举整个进程),勾一个窗口会把同进程的所有窗口一起藏掉。现在:
 - 手动勾选走 `hide_hwnds()`,只动勾中的那几个 HWND,兄弟窗口原样保留;
 - 场景/规则走 `hide_pids()`,语义本来就是"整个程序",保持不变;
-- 同一进程只藏了一部分时(`HiddenProcess.partial`)不删托盘图标、不静音
-  —— 这两件事都是整进程级的,做了会连带影响还留在屏幕上的窗口。
+- 同一进程只藏了一部分时(`HiddenProcess.partial`)**不删托盘图标**(图标
+  不像音量能自己恢复,半藏状态下删掉就成了"浏览器还在、图标没了");
+  静音**照做** —— 用户要的是"藏了就别响",代价是同程序其它窗口一起没声,
+  这一点在「声音」列和状态栏里说清楚。
+- 要不要静音**只有一处判定**:`should_mute()`(声音列 > 场景三态 > 全局)。
 
 隐藏状态会持久化到 %APPDATA%/WindowHide/hidden_state.json:
 本工具重启/崩溃后,被隐藏的窗口不会变成"孤儿"(任务栏没有、界面里也
@@ -30,6 +33,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from ..config import MUTE_ALWAYS, MUTE_INHERIT, MUTE_NEVER
 from . import protect
 from . import win32
 from .audio import set_process_mute
@@ -238,9 +242,65 @@ class HideController(QObject):
         """
         with self._lock:
             names = [hp.process_name for hp in self._hidden.values()
-                     if hp.partial and hp.muted
-                     and not self._settings.keeps_audio(hp.process_name)]
+                     if hp.partial and hp.muted]
         return list(dict.fromkeys(names))
+
+    def mute_reason_for(self, process_name: str) -> tuple[bool, str]:
+        """界面上问"这个程序现在藏了会不会静音"用。
+
+        已经藏着的,按它当初被哪个场景藏来判(否则界面上显示的原因和实际
+        听到的声音对不上);没藏的,按"手动勾选隐藏"算 —— 手动隐藏不带场景。
+        """
+        key = (process_name or "").strip().lower()
+        if not key:
+            return False, "没开静音"
+        with self._lock:
+            prof = next((hp.profile for hp in self._hidden.values()
+                         if (hp.process_name or "").lower() == key), "")
+        return self.mute_reason(process_name, prof)
+
+    # ------------------------------------------------------------ 静音判定
+    def should_mute(self, process_name: str, profile_name: str = "") -> bool:
+        """隐藏这个程序时到底要不要静音 —— **全程序唯一判定入口**。
+
+        以前这件事被写在三个地方(`_hide_one`、`set_audio_policy`、
+        场景的 `profile.mute`),而且场景那个是跟全局 **OR** 起来的:
+        用户关掉行为页的开关、切到场景照样被静音,看着就是"两个开关打架"。
+        现在只有一个函数、一条明确的优先级,谁也别再各自算一遍。
+
+        优先级(高 → 低):
+          1. 主界面「声音」列勾了「藏了继续响」→ **不静音**(绝对豁免)
+          2. 场景的静音模式:总是静音 / 从不静音
+          3. 跟随全局(设置 → 行为 →「隐藏时同时静音目标程序」)
+        """
+        if self._settings.keeps_audio(process_name):
+            return False
+        prof = self._settings.profile(profile_name) if profile_name else None
+        mode = getattr(prof, "mute_mode", MUTE_INHERIT) if prof else MUTE_INHERIT
+        if mode == MUTE_ALWAYS:
+            return True
+        if mode == MUTE_NEVER:
+            return False
+        return bool(self._settings.mute_on_hide)
+
+    def mute_reason(self, process_name: str,
+                    profile_name: str = "") -> tuple[bool, str]:
+        """(要不要静音, 为什么) —— 界面上直接把理由摆出来。
+
+        三个开关各自都能改结果,只显示一个勾选框的话,用户永远看不出
+        "我明明关掉了静音,为什么它还在静音"。原因文案就是为这个存在的。
+        """
+        if self._settings.keeps_audio(process_name):
+            return False, "「声音」列勾了「藏了继续响」"
+        prof = self._settings.profile(profile_name) if profile_name else None
+        mode = getattr(prof, "mute_mode", MUTE_INHERIT) if prof else MUTE_INHERIT
+        if mode == MUTE_ALWAYS:
+            return True, f"场景「{prof.name}」设了「总是静音」"
+        if mode == MUTE_NEVER:
+            return False, f"场景「{prof.name}」设了「从不静音」"
+        if self._settings.mute_on_hide:
+            return True, "全局设了「隐藏时同时静音」"
+        return False, "没开静音"
 
     # ------------------------------------------------------------ 工作线程
     def _submit(self, fn, *args) -> bool:
@@ -292,14 +352,14 @@ class HideController(QObject):
 
     # ------------------------------------------------------------ 隐藏
     def hide_pids(self, pids: list[int], wait: bool = False,
-                  mute: bool | None = None, profile: str = "") -> int:
+                  profile: str = "") -> int:
         """隐藏指定进程的所有可见顶层窗口。
 
         `wait=False`(默认)时丢到工作线程去做、立即返回 0 —— 界面调用一律
         用这个,主线程绝不碰跨进程窗口调用(目标卡住会把 UI 一起冻死)。
         `wait=True` 是同步版本,给测试和"退出前必须做完"的路径用。
-        `mute=True` 用于场景自带的"顺带静音";None 表示只看全局设置。
-        `profile` 记录"是哪个场景藏的",切换场景时要据此回收。
+        `profile` 记录"是哪个场景藏的":切换场景时要据此回收,同时也是
+        **静音判定的输入之一**(见 should_mute)。
         """
         with self._lock:
             # 用户主动藏 = 撤销"别再自动藏我"。必须在这里做,不能放在
@@ -310,12 +370,12 @@ class HideController(QObject):
                 self._pending[pid] = "hide"
         if wait:
             self._wait_idle()
-            return self._hide_pids_blocking(pids, mute=mute, profile=profile)
-        self._submit(self._hide_pids_blocking, list(pids), mute, profile)
+            return self._hide_pids_blocking(pids, profile=profile)
+        self._submit(self._hide_pids_blocking, list(pids), profile)
         return 0
 
-    def _hide_pids_blocking(self, pids: list[int], mute: bool | None = None,
-                            profile: str = "", quiet: bool = False,
+    def _hide_pids_blocking(self, pids: list[int], profile: str = "",
+                            quiet: bool = False,
                             only: dict[int, list[int]] | None = None) -> int:
         """`only` 给定时只藏其中列出的窗口(手动勾选),否则藏整个进程。"""
         done = 0
@@ -358,7 +418,7 @@ class HideController(QObject):
             # 单个进程出任何意外都不能拖垮整批(以前一个异常就让剩下
             # 勾选的窗口一个都不藏)
             try:
-                hp = self._hide_one(pid, mute=mute, profile=profile, only=want)
+                hp = self._hide_one(pid, profile=profile, only=want)
             except Exception:
                 from ..log import write
                 write(f"隐藏 {name} 时出现异常:\n{traceback.format_exc()}")
@@ -433,7 +493,7 @@ class HideController(QObject):
         return done
 
     def hide_hwnds(self, hwnds: list[int], wait: bool = False,
-                   mute: bool | None = None, profile: str = "") -> int:
+                   profile: str = "") -> int:
         """隐藏**这几个窗口**——不看同一进程还有什么别的窗口。
 
         和 `hide_pids` 的唯一区别就在这里,也是"勾一个浏览器窗口、其它
@@ -468,14 +528,14 @@ class HideController(QObject):
                     self._pending_hwnd[hwnd] = "hide"
         if wait:
             self._wait_idle()
-            return self._hide_hwnds_worker(groups, mute, profile)
-        self._submit(self._hide_hwnds_worker, groups, mute, profile)
+            return self._hide_hwnds_worker(groups, profile)
+        self._submit(self._hide_hwnds_worker, groups, profile)
         return 0
 
     def _hide_hwnds_worker(self, groups: dict[int, list[int]],
-                           mute: bool | None, profile: str) -> int:
+                           profile: str) -> int:
         try:
-            return self._hide_pids_blocking(list(groups), mute=mute,
+            return self._hide_pids_blocking(list(groups),
                                             profile=profile, only=groups)
         finally:
             with self._lock:
@@ -520,7 +580,7 @@ class HideController(QObject):
             return True
         return False
 
-    def _hide_one(self, pid: int, mute: bool | None = None,
+    def _hide_one(self, pid: int,
                   profile: str = "",
                   only: list[int] | None = None) -> HiddenProcess | None:
         """藏一个进程的窗口。`only` 给定时只藏这些 hwnd(逐个藏)。
@@ -583,10 +643,8 @@ class HideController(QObject):
         # 托盘图标和静音都是**整进程级**的,处置方式不一样:
         # - 托盘图标只在整个进程都藏干净时删。只藏一半还删图标,用户看到的是
         #   "浏览器明明还在,托盘图标没了" —— 而且不给恢复指令就回不来;
-        # - 静音照做(用户默认期望"藏了就安静"),代价是同程序没藏的窗口也会
-        #   一起没声。要保留声音,就在主界面「声音」列勾上「藏了继续响」。
-        keep_audio = self._settings.keeps_audio(name)
-        want_mute = (not keep_audio) and bool(mute or self._settings.mute_on_hide)
+        # - 要不要静音由 should_mute 一处说了算(声音列 > 场景模式 > 全局)。
+        want_mute, why = self.mute_reason(name, profile)
         if not partial:
             delete_process_tray_icons(pid)
         if want_mute:
@@ -596,9 +654,9 @@ class HideController(QObject):
                 from ..log import write
                 write(f"{name} 只藏了一部分窗口,静音连带未隐藏的窗口一起没声"
                       "(想保留声音:主界面「声音」列勾「藏了继续响」)")
-        elif keep_audio and (mute or self._settings.mute_on_hide):
+        elif why != "没开静音":
             from ..log import write
-            write(f"{name} 在「藏了继续响」名单里,隐藏时不静音")
+            write(f"{name} 隐藏时不静音({why})")
         return hp
 
     # ------------------------------------------------------------ 恢复
@@ -782,6 +840,9 @@ class HideController(QObject):
         否则用户勾上"继续响"却发现音乐还是没声,只能先恢复再藏一次 ——
         而"恢复再藏"会把窗口弹到前台,正是他想避免的事。
         返回受影响(正在隐藏中)的程序数。
+
+        `keep_audio` 调用方必须**先**写进 config(`set_keeps_audio`);这里
+        不直接用它,而是统一走 `should_mute()`,免得又出现"第二套算法"。
         """
         name = (process_name or "").strip().lower()
         if not name:
@@ -792,17 +853,15 @@ class HideController(QObject):
         if not targets:
             return 0
 
-        def want_mute(pid: int) -> bool:
-            if keep_audio:
-                return False
-            with self._lock:
-                hp = self._hidden.get(pid)
-            prof = self._settings.profile(hp.profile) if (hp and hp.profile) else None
-            return bool(self._settings.mute_on_hide or (prof and prof.mute))
-
         def run():
             for pid in targets:
-                target = want_mute(pid)
+                with self._lock:
+                    hp = self._hidden.get(pid)
+                    prof_name = hp.profile if hp else ""
+                # 判定走同一个 should_mute —— 以前这里自己算了一遍
+                # (而且漏掉了场景的"从不静音"),于是界面上刚取消勾选、
+                # 下一秒又被别处的规则按回去。
+                target = self.should_mute(name, prof_name)
                 if target:
                     n = set_process_mute(pid, True)
                     with self._lock:
@@ -906,8 +965,7 @@ class HideController(QObject):
         if not target_pids:
             self.action_done.emit("profile_empty", 0)
             return
-        self._hide_pids_blocking(target_pids, mute=profile.mute,
-                                 profile=profile.name)
+        self._hide_pids_blocking(target_pids, profile=profile.name)
 
     def _profile_targets(self, profile) -> list[int]:
         """当前可见、命中该场景规则、且不该被跳过的进程。"""
@@ -1021,7 +1079,7 @@ class HideController(QObject):
         if not target_pids:
             return
         before = self.hidden_summary()[0]
-        self._hide_pids_blocking(target_pids, mute=profile.mute,
+        self._hide_pids_blocking(target_pids,
                                  profile=profile.name, quiet=True)
         after = self.hidden_summary()[0]
         # 藏不掉的别每 3 秒重试一遍(白耗 CPU,日志也会淹)

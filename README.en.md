@@ -100,14 +100,18 @@ immediately to programs that are already hidden.
   "version": 2,
   "active_profile": "Work",
   "profiles": [
-    {"name": "Work", "mute": true,
+    {"name": "Work", "mute_mode": "always",
      "rules": [{"process": "Steam.exe", "window_class": "", "title_regex": "", "label": "Steam"}]},
-    {"name": "Game", "mute": false, "rules": []}
+    {"name": "Game", "mute_mode": "never", "rules": []}
   ],
   "protected_processes": ["SomeMonitoringAgent.exe"],
   "keep_audio_processes": ["lx-music-desktop.exe"]
 }
 ```
+
+`mute_mode` is one of `inherit` (follow the global "mute on hide"), `always` or
+`never`. The old boolean `mute` is still read: `true` → `always`, `false` →
+`inherit`.
 
 A v1 config (flat `targets`) is upgraded automatically on start, and the original
 file is kept as `config.v1.bak.json`.

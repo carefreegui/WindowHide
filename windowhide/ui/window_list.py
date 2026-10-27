@@ -82,7 +82,9 @@ class WindowTable(QTableWidget):
         self._procs: list[str] = []       # 与 _hwnds 平行:每行的进程名
         self._checked: set[int] = set()   # 勾选状态按 hwnd 保存,跨刷新保留
         self._keep_audio: set[str] = set()  # 小写进程名:藏了继续响
-        self._mute_global = False         # 仅用于提示文案
+        # 进程名 -> (会不会静音, 为什么)。只有提示文案用,但很关键:
+        # 三处设置都能改结果,不写"为什么"用户永远看不出是谁在起作用。
+        self._mute_reasons: dict[str, tuple[bool, str]] = {}
         self._syncing = False             # 重建表格时为真,避免 itemChanged 干扰
         self.setColumnCount(7)
         self.setHorizontalHeaderLabels(
@@ -156,24 +158,27 @@ class WindowTable(QTableWidget):
             self.sound_toggled.emit(proc, keep)
 
     def _sound_tip(self, proc: str, keep: bool) -> str:
+        will_mute, why = self._mute_reasons.get(
+            proc.lower(), (False, "没开静音"))
+        head = ("现在隐藏它:会静音" if will_mute else "现在隐藏它:不静音")
         if keep:
-            return (f"{proc}:隐藏时不静音,声音继续放。\n"
-                    "(按程序生效:同程序的其它窗口也一样)")
-        default = "隐藏时静音" if self._mute_global else "隐藏时不动声音"
-        return (f"{proc}:跟随全局设置 —— 当前是「{default}」。\n"
-                "想让它在后台继续响,勾上这一格。")
+            return (f"{proc}\n\n{head}(「声音」列勾了「藏了继续响」)\n"
+                    "按程序生效:同程序的其它窗口也一样。")
+        return (f"{proc}\n\n{head}\n原因:{why}\n\n"
+                "想让它在后台继续响,勾上这一格(优先级最高)。")
 
     def refresh(self, windows: list[WindowInfo], hidden_hwnds: set[int],
                 our_pid: int, protected: set[str] | None = None,
                 keep_audio: set[str] | None = None,
-                mute_global: bool = False) -> None:
+                mute_reasons: dict[str, tuple[bool, str]] | None = None) -> None:
         # 定时器每 1.5s 会整体重建表格;勾选状态和滚动位置必须保留,
         # 否则用户刚勾的窗口下一秒就被取消,根本没法累积选择。
         old_checked = self._checked
         scroll = self.verticalScrollBar().value()
         if keep_audio is not None:
             self._keep_audio = {p.lower() for p in keep_audio}
-        self._mute_global = mute_global
+        if mute_reasons is not None:
+            self._mute_reasons = {k.lower(): v for k, v in mute_reasons.items()}
         # 只清理**真的没了**的窗口(进程退出/窗口销毁)。窗口暂时不在列表里
         # (被搜索框过滤、异步隐藏还没落地)不算消失,勾选要留着 ——
         # 用户实测:"多按几次隐藏快捷键,勾选自己就没了,然后再按就认不出来"。
