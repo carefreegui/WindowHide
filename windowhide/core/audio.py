@@ -204,16 +204,25 @@ def session_pids() -> dict[int, int]:
 
 
 def _pids_with_descendants(pid: int) -> list[int]:
-    """目标 pid + 其所有子孙进程。
+    """目标 pid + **同映像名**的子孙进程。
 
     Chromium 系浏览器(Edge/Chrome)的音频在 audio service 子进程里放,
     只按主窗口 pid 找会话什么都静不了(用户实测:浏览器静不了、游戏能静,
-    因为游戏是主进程直接放音频)。快照失败时退化为单进程。
+    因为游戏是主进程直接放音频)。所以必须带上子进程。
+
+    但**绝对不能带所有子孙** —— explorer.exe 是桌面所有程序的父进程,
+    实测一台普通机器上它有 84 个子孙(含 19 个 msedge.exe、各种 IDE、
+    终端)。按整棵树静音一个文件资源管理器窗口,会把桌面上所有正在放
+    声音的程序一起掐掉(用户实测的"逆天 bug")。
+
+    稳妥的判据是"同名":Chromium 的多进程子进程映像名和主进程完全一样
+    (都是 msedge.exe),所以同名既够用、又不会牵到 explorer 名下的
+    其它程序。快照失败时退化为单进程。
     """
     from . import win32
     pids = [pid]
     try:
-        pids.extend(sorted(win32.process_descendants(pid)))
+        pids.extend(sorted(win32.process_descendants(pid, same_name=True)))
     except Exception:
         pass
     return pids

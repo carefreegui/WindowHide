@@ -571,35 +571,49 @@ def process_is_higher_integrity(pid: int) -> bool:
     return GetLastError() == ERROR_ACCESS_DENIED
 
 
-def process_descendants(pid: int) -> set[int]:
+def process_descendants(pid: int, same_name: bool = False) -> set[int]:
     """返回 pid 的所有子孙进程 id(不含自身)。
 
     用途:Chromium 系浏览器(Edge/Chrome)的音频不在主进程放,而在
     audio service 子进程放 —— 按主窗口 pid 静音找不到会话,必须把
     整个进程树都算上。快照失败时返回空集合(调用方按单进程处理)。
+
+    **`same_name=True` 只保留映像名与目标相同的子孙**,这是静音时必须用的。
+    原因:explorer.exe 是桌面所有程序的父进程(实测一台普通机器上就有 84 个
+    子孙,含 19 个 msedge.exe)。按整棵树静音 explorer,等于把桌面上所有
+    正在放声音的程序一起掐掉 —— 用户实测"藏一个 D 盘文件夹,浏览器视频
+    没声了"。而 Chromium 的多进程模型下**子进程的映像名和主进程一模一样**
+    (都是 msedge.exe / chrome.exe),所以"同名"既够用又不会误伤。
     """
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snap in (0, -1) or snap == wintypes.HANDLE(-1).value:
         return set()
     children: dict[int, list[int]] = {}
+    names: dict[int, str] = {}
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         ok = Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            children.setdefault(int(entry.th32ParentProcessID), []).append(
-                int(entry.th32ProcessID))
+            child = int(entry.th32ProcessID)
+            children.setdefault(int(entry.th32ParentProcessID), []).append(child)
+            names[child] = str(entry.szExeFile).lower()
             ok = Process32NextW(snap, ctypes.byref(entry))
     finally:
         CloseHandle(snap)
 
+    target = names.get(pid, "")
     out: set[int] = set()
+    seen: set[int] = set()
     queue = list(children.get(pid, ()))
     while queue:
         cur = queue.pop()
-        if cur in out or cur == pid:
+        if cur == pid or cur in seen:
             continue
-        out.add(cur)
+        seen.add(cur)
+        # 不同名的仍然继续往下走(可能有同名孙进程),只是不计入结果
+        if not same_name or not target or names.get(cur, "") == target:
+            out.add(cur)
         queue.extend(children.get(cur, ()))
     return out
 
