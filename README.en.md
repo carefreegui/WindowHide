@@ -44,6 +44,10 @@ No DLL injection, no global hooks, no synthetic input: only documented Win32 API
   (`IsHungAppWindow`). A stuck target can no longer freeze the UI.
 - **Mute on hide** — mutes the target program through the system volume mixer,
   including its child processes (browsers play audio in a child process).
+- **Mouse side buttons work as hotkeys** — bound through a low-level mouse hook and
+  active **alongside** the keyboard combo. Whichever hand is free is the one that
+  works; nothing to move first. The side button you bind is consumed by the tool, so
+  it stops acting as browser back/forward; the other one keeps working normally.
 - **Per-program audio policy** — the「声音」column decides, per program, whether it
   keeps playing audio while hidden (music player, background call) or follows the
   global "mute on hide" setting. Windows mixes audio **per process**, so two windows
@@ -90,6 +94,10 @@ is ticked.
 The「声音」(sound) column is per **program**: ticked means the program keeps playing
 audio while hidden; unticked means it follows "mute on hide". Changes apply
 immediately to programs that are already hidden.
+
+A keyboard combo and a **mouse side button** can be bound at the same time and both
+work: left cell takes the keyboard combo, the right cell takes the side button
+(press `Delete` to clear).
 
 ## Configuration
 

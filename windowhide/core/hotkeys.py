@@ -1,7 +1,16 @@
-"""hotkeys.py - 全局热键(RegisterHotKey)。
+"""hotkeys.py - 全局热键(键盘 RegisterHotKey + 鼠标侧键低级钩子)。
 
 独立线程里建消息窗口跑消息循环,收到 WM_HOTKEY 后通过 Qt 信号
 转发到主线程。改快捷键 = 重启线程,成本可忽略。
+
+**为什么要两套机制**:
+`RegisterHotKey` 只认键盘虚拟键码,没有"鼠标侧键"这个东西。侧键只能用
+`WH_MOUSE_LL` 低级钩子接管。两套机制同时挂在同一个线程上,因为低级钩子
+要求安装它的线程**有消息循环** —— 这里正好有一个现成的。
+
+侧键的取舍:用户既然把它设成热键,就说明想用它当老板键,所以匹配时
+**吃掉事件**(不让浏览器前进/后退)。没设成热键的侧键一律放行,浏览器
+照常用 —— 只有你主动配置的那一个会失效。
 """
 from __future__ import annotations
 
@@ -12,12 +21,16 @@ from ctypes import wintypes
 
 from PySide6.QtCore import QObject, Signal
 
+from ..config import MOUSE_VKS, VK_XBUTTON1, VK_XBUTTON2
 from .win32 import (
     user32, kernel32,
     CreateWindowExW, DefWindowProcW, RegisterClassW, UnregisterClassW,
     GetMessageW, TranslateMessage, DispatchMessageW, RegisterHotKey,
     UnregisterHotKey, PostQuitMessage, DestroyWindow, GetModuleHandleW,
     WM_HOTKEY, WM_QUIT, WM_DESTROY, HWND_MESSAGE,
+    SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, xbutton_of,
+    WH_MOUSE_LL, HC_ACTION, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    XBUTTON1, XBUTTON2,
 )
 
 WM_APP = 0x8000
@@ -70,17 +83,61 @@ for _i in range(0x41, 0x5B):
 for _i in range(0x30 + 0x30, 0x3A + 0x30):
     VK_NAMES[_i] = f"Numpad{_i - 0x30}"
 
+# 鼠标侧键。名字带括号是给用户看的:多数人不知道"侧键"在浏览器里
+# 默认干的是前进/后退,不写出来他不会意识到设置后这个功能会失效。
+VK_NAMES[VK_XBUTTON1] = "鼠标侧键 1(后退键)"
+VK_NAMES[VK_XBUTTON2] = "鼠标侧键 2(前进键)"
+
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 
+LOWLEVELHOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                      wintypes.WPARAM, wintypes.LPARAM)
+
+
+class _CaptureBus(QObject):
+    """录入侧键时的转发总线。
+
+    为什么不让录入按钮直接收 Qt 的鼠标事件:实测过 —— `QPushButton`
+    收不到 `BackButton`,因为侧键的 WM_XBUTTONDOWN 只发给**光标下的窗口**,
+    捕获时用户手还在鼠标上,光标未必落在那个按钮里,事件就丢了。
+
+    所以捕获也走同一个钩子:钩子此刻**不拦截**,把侧键编号通过这个总线
+    转给界面。好处是顺带解决了"钩子把自己的输入吃掉"的死结 —— 否则
+    用户永远没法把侧键从 A 改成 B。
+    """
+    captured = Signal(int)   # 侧键的伪 VK
+
+
+capture_bus = _CaptureBus()
+
+# 捕获态用 Event 而不是布尔:钩子在线程里读,界面在主线程写,得是原子的。
+# 不加锁读取(Event.is_set 自带锁),也不会阻塞钩子回调。
+_capturing = threading.Event()
+
+
+def set_capturing(on: bool) -> None:
+    """界面进入/退出"等待按键"状态时调用。"""
+    if on:
+        _capturing.set()
+    else:
+        _capturing.clear()
+
+
+def is_capturing() -> bool:
+    return _capturing.is_set()
+
 
 def hotkey_label(mods: int, vk: int) -> str:
-    """格式化为 'Ctrl + Alt + H'。"""
+    """格式化为 'Ctrl + Alt + H' / '鼠标侧键 1(后退键)'。"""
     if not vk:
         return "未设置"
+    if vk in MOUSE_VKS:
+        # 侧键没有修饰符的概念,别拼出 "Ctrl + 鼠标侧键" 这种看不懂的东西
+        return VK_NAMES.get(vk, "鼠标侧键")
     parts = []
     if mods & MOD_CONTROL:
         parts.append("Ctrl")
@@ -101,6 +158,7 @@ class HotkeyManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._specs: dict[str, tuple[int, int]] = {}   # action -> (mods, vk)
+        self._mouse: dict[str, int] = {}               # action -> 侧键伪 VK
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._hwnd = 0
@@ -108,12 +166,23 @@ class HotkeyManager(QObject):
         self._class_seq = 0
 
     # ------------------------------------------------------------ 公共接口
-    def set_hotkeys(self, specs: dict[str, tuple[int, int]]) -> None:
-        """设置热键表并重启注册线程。specs: action -> (mods, vk)。"""
+    def set_hotkeys(self, specs: dict[str, tuple[int, int]],
+                    mouse: dict[str, int] | None = None) -> None:
+        """设置热键表并重启注册线程。
+
+        specs: action -> (mods, vk),键盘组合键。
+        mouse: action -> 侧键伪 VK(0 = 这个动作不配侧键)。
+
+        两者是**并存**关系而不是二选一:同一个动作可以既挂键盘组合、又挂
+        鼠标侧键,哪个在手边用哪个。这也正是老板键的使用姿势 —— 藏窗口
+        往往是一瞬间的事,没时间去把另一只手挪过来。
+        """
         with self._lock:
             self._specs = dict(specs)
+            self._mouse = dict(mouse or {})
             self._stop_thread()
-            if any(vk for _, vk in specs.values()):
+            if (any(vk for _, vk in specs.values())
+                    or any(self._mouse.values())):
                 self._thread = threading.Thread(target=self._run, daemon=True)
                 self._thread.start()
 
@@ -141,6 +210,7 @@ class HotkeyManager(QObject):
     def _run(self) -> None:
         with self._lock:
             specs = dict(self._specs)
+            mouse_cfg = dict(self._mouse)
             self._class_seq += 1
             # 类名必须唯一:同名类第二次 RegisterClassW 必然失败。
             # 曾经的 bug:改设置后热注册时旧线程还没退出完,新线程注册
@@ -150,6 +220,17 @@ class HotkeyManager(QObject):
 
         hinstance = GetModuleHandleW(None)
         local_map: dict[int, str] = {}   # 本线程的热键 id -> action(闭包捕获)
+
+        # 侧键单独一张表:它们不走 RegisterHotKey(那个接口不认识鼠标),
+        # 由下面的低级钩子处理。两种来源都收:显式给的 mouse 参数,以及
+        # 直接写在 specs 里的侧键(=某些调用方/测试的简写)。
+        mouse_map: dict[int, str] = {}
+        for a, (_m, vk) in specs.items():
+            if vk in MOUSE_VKS:
+                mouse_map[vk] = a
+        for a, vk in mouse_cfg.items():
+            if vk:
+                mouse_map[vk] = a
 
         def wndproc(hwnd, umsg, wparam, lparam):
             if umsg == WM_HOTKEY:
@@ -177,8 +258,8 @@ class HotkeyManager(QObject):
 
         failed = []
         for i, (action, (mods, vk)) in enumerate(specs.items()):
-            if not vk:
-                continue
+            if not vk or vk in MOUSE_VKS:
+                continue      # 侧键交给钩子,RegisterHotKey 不支持
             hid = i + 1
             # 正常路径下 _stop_thread 已 join 等旧线程退干净(其 finally 会
             # UnregisterHotKey),不会冲突。但万一旧线程退出超时(2s)还没死,
@@ -194,8 +275,62 @@ class HotkeyManager(QObject):
         self._hwnd_to_action = local_map
 
         from ..log import write
+
+        # ---- 鼠标侧键钩子 ----
+        # 无条件安装:当下没配侧键也装 —— 用户随时可能进设置页录入,而线程
+        # 不会为此重启。快路径只有两次整数比较,1000Hz 鼠标每秒过 1000 次
+        # 也只是多几次函数返回,不值得为此加一套"按需装卸"的同步机制。
+        hook_id = 0
+        hook_proc = None
+
+        def mouse_proc(ncode, wparam, lparam):
+            # 快路径:不是侧键就立刻走人。装了钩子之后**每个**鼠标事件
+            # (移动、滚轮、左右键)都会进这里,这一行必须最省。
+            if ncode == HC_ACTION and (wparam == WM_XBUTTONDOWN
+                                       or wparam == WM_XBUTTONUP):
+                btn = xbutton_of(lparam)
+                vk = (VK_XBUTTON1 if btn == XBUTTON1
+                      else VK_XBUTTON2 if btn == XBUTTON2 else 0)
+                if vk:
+                    if is_capturing():
+                        # 正在录入新热键:放行,只把"按下"转给界面。
+                        # 不这样的话钩子会吃掉自己的输入 —— 侧键设成 A
+                        # 之后就再也改不成 B 了。
+                        if wparam == WM_XBUTTONDOWN:
+                            capture_bus.captured.emit(vk)
+                    else:
+                        action = mouse_map.get(vk)
+                        if action:
+                            if wparam == WM_XBUTTONDOWN:
+                                self.triggered.emit(action)
+                            # 吃掉。DOWN 和 UP 都得拦:只拦 DOWN 会让浏览器
+                            # 收到一个没有配对的孤儿 UP,个别程序会卡在
+                            # "按住"状态。
+                            return 1
+            return CallNextHookEx(0, ncode, wparam, lparam)
+
+        hook_err = 0
+        try:
+            hook_proc = LOWLEVELHOOKPROC(mouse_proc)
+            hook_id = SetWindowsHookExW(
+                WH_MOUSE_LL, ctypes.cast(hook_proc, ctypes.c_void_p),
+                hinstance, 0)
+            if not hook_id:
+                hook_err = kernel32.GetLastError()
+        except Exception:
+            hook_id, hook_err = 0, -1
+
         write("热键注册: " + (", ".join(
             f"{a}={hotkey_label(*specs[a])}" for a in wanted) or "无"))
+        if mouse_map:
+            # 单独记一行:不然日志里只有键盘键,"侧键没反应"就无从查起
+            write("鼠标侧键: " + ", ".join(
+                f"{a}={hotkey_label(0, vk)}" for vk, a in mouse_map.items()))
+        if not hook_id:
+            write(f"鼠标侧键钩子安装失败(err={hook_err})")
+            if mouse_map:
+                # 配了侧键却装不上钩子 = 那几个热键根本不存在,必须报出来
+                self.register_failed.emit(",".join(mouse_map.values()))
         if failed:
             write("热键注册失败(可能被其它软件占用): " + ",".join(failed))
             self.register_failed.emit(",".join(failed))
@@ -211,6 +346,8 @@ class HotkeyManager(QObject):
         finally:
             # 退出清理。注意:不能持 self._lock —— _stop_thread 持锁 join
             # 本线程,这里抢锁会死锁。
+            if hook_id:
+                UnhookWindowsHookEx(hook_id)
             for hid in list(local_map):
                 UnregisterHotKey(hwnd, hid)
             DestroyWindow(hwnd)

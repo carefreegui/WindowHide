@@ -1134,3 +1134,58 @@ def file_description(path: str) -> str:
 
 def clear_description_cache() -> None:
     _DESC_CACHE.clear()
+
+
+# ---------------------------------------------------------------- 鼠标侧键
+# 为什么用低级钩子(WH_MOUSE_LL)而不是 RegisterHotKey:
+# RegisterHotKey 只认键盘虚拟键码,压根没有"鼠标侧键"这个概念。想接管
+# XBUTTON1/2 只有两条路 —— Raw Input(要建隐藏窗口接收 WM_INPUT,还得
+# 抢注册)或者低级鼠标钩子。钩子更简单,而且能**决定是否放行**。
+#
+# 代价:装了钩子之后每个鼠标事件都会进我们的回调。回调里必须第一时间
+# 用纯比较挡掉绝大多数事件(见 hotkeys.py 的 _hook_proc),不然 1000Hz
+# 的游戏鼠标会把 Python 回调打满。
+WH_MOUSE_LL = 14
+HC_ACTION = 0
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP = 0x020C
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
+
+# SetWindowsHookExW / UnhookWindowsHookEx 的签名必须显式声明:
+# 钩子句柄(HHOOK)在 64 位下是指针,按默认 int 返回会被截断成 32 位,
+# 之后 Unhook 传进去就是无效句柄 —— 表现为"钩子卸载不掉,一直占着"。
+SetWindowsHookExW = user32.SetWindowsHookExW
+SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                              wintypes.HINSTANCE, wintypes.DWORD]
+SetWindowsHookExW.restype = ctypes.c_void_p
+
+UnhookWindowsHookEx = user32.UnhookWindowsHookEx
+UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+UnhookWindowsHookEx.restype = wintypes.BOOL
+
+CallNextHookEx = user32.CallNextHookEx
+CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                           wintypes.WPARAM, wintypes.LPARAM]
+CallNextHookEx.restype = ctypes.c_ssize_t
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    """低级鼠标钩子回调里的 lParam 指过来的结构。"""
+    _fields_ = [
+        ("pt", POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+def xbutton_of(lparam: int) -> int:
+    """从钩子的 lParam 里取出是哪个侧键;不是 XBUTTON 消息返回 0。
+
+    侧键编号藏在 mouseData 的**高 16 位**(低 16 位是滚轮增量,别搞混)。
+    """
+    data = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+    n = (int(data.mouseData) >> 16) & 0xFFFF
+    return n if n in (XBUTTON1, XBUTTON2) else 0

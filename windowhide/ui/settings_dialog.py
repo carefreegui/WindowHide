@@ -5,8 +5,8 @@ import copy
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QGridLayout,
+    QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QScrollArea,
     QTabWidget, QVBoxLayout, QWidget,
 )
@@ -80,16 +80,50 @@ class SettingsDialog(QDialog):
         mv.addWidget(self._mode_split)
         v.addWidget(mode_box)
 
-        form = QFormLayout()
+        # 每个动作两格:键盘组合 + 可选的鼠标侧键。它们**同时生效** ——
+        # 老板键讲究的是"手现在在哪边",不是"你更喜欢哪个"。
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+
+        def col_hint(text: str) -> QLabel:
+            lab = QLabel(text)
+            lab.setStyleSheet("color: #64748b;")
+            return lab
+
+        grid.addWidget(QWidget(), 0, 0)                  # 占位,让表头对齐
+        grid.addWidget(col_hint("键盘组合键"), 0, 1)
+        grid.addWidget(col_hint("鼠标侧键(可选,同时生效)"), 0, 2)
+
         self._cap_toggle = HotkeyCaptureButton(self._config.hotkey_toggle)
         self._cap_hide = HotkeyCaptureButton(self._config.hotkey_hide)
         self._cap_restore = HotkeyCaptureButton(self._config.hotkey_restore)
-        form.addRow("切换键:", self._cap_toggle)
-        form.addRow("隐藏键:", self._cap_hide)
-        form.addRow("恢复键:", self._cap_restore)
-        self._hotkey_form = form
-        v.addLayout(form)
-        # 模式切换时显隐输入行:选"单一"只显示切换键,
+        self._cap_toggle_mouse = HotkeyCaptureButton(
+            self._config.hotkey_toggle_mouse, mouse_only=True)
+        self._cap_hide_mouse = HotkeyCaptureButton(
+            self._config.hotkey_hide_mouse, mouse_only=True)
+        self._cap_restore_mouse = HotkeyCaptureButton(
+            self._config.hotkey_restore_mouse, mouse_only=True)
+
+        for cap in (self._cap_toggle, self._cap_hide, self._cap_restore):
+            cap.setToolTip("点一下进入录入,然后按键盘组合键。\n"
+                           "手在键盘上时用它;想在鼠标上也能触发,"
+                           "就给右边那一格也设个侧键。")
+
+        self._hotkey_rows: list[tuple[QWidget, ...]] = []
+        rows = [("切换:", self._cap_toggle, self._cap_toggle_mouse),
+                ("隐藏:", self._cap_hide, self._cap_hide_mouse),
+                ("恢复:", self._cap_restore, self._cap_restore_mouse)]
+        for i, (label, kb, ms) in enumerate(rows, start=1):
+            lab = QLabel(label)
+            grid.addWidget(lab, i, 0)
+            grid.addWidget(kb, i, 1)
+            grid.addWidget(ms, i, 2)
+            self._hotkey_rows.append((lab, kb, ms))
+        v.addLayout(grid)
+        # 模式切换时显隐行:选"单一"只显示切换键,
         # 选"两个"才出现隐藏键/恢复键(旧版三个框并列,填了不生效,纯误导)
         self._mode_toggle.toggled.connect(self._sync_hotkey_rows)
         self._mode_split.toggled.connect(self._sync_hotkey_rows)
@@ -105,7 +139,11 @@ class SettingsDialog(QDialog):
         ev.addLayout(row)
         tip = QLabel("「隐藏本工具」= 把本工具主窗口收进系统托盘(不是藏别人窗口),"
                      "与点右上角叉号等效;双击托盘图标可唤回。\n"
-                     "提示:全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。")
+                     "全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。\n\n"
+                     "鼠标侧键:点右边那一格,然后直接按侧键。键盘组合键和侧键"
+                     "各一个,同时生效 —— 手在哪边就用哪边。\n"
+                     "注意:设成快捷键的那个侧键,以后在浏览器里不再「前进/后退」"
+                     "—— 事件被本工具接管了;没设的那一个照常可用。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color: #64748b;")
         ev.addWidget(tip)
@@ -115,10 +153,13 @@ class SettingsDialog(QDialog):
 
     def _sync_hotkey_rows(self) -> None:
         """按模式显隐输入行:单一快捷键只显示切换键,两个快捷键才显示隐藏/恢复键。"""
+        if not getattr(self, "_hotkey_rows", None):
+            return
         split = self._mode_split.isChecked()
-        self._hotkey_form.setRowVisible(self._cap_toggle, not split)
-        self._hotkey_form.setRowVisible(self._cap_hide, split)
-        self._hotkey_form.setRowVisible(self._cap_restore, split)
+        for i, widgets in enumerate(self._hotkey_rows):
+            visible = split if i else not split   # 第 0 行是"切换"
+            for w in widgets:
+                w.setVisible(visible)
 
     def _behavior_tab(self) -> QWidget:
         w = QWidget()
@@ -369,6 +410,9 @@ class SettingsDialog(QDialog):
         config.hotkey_toggle = self._cap_toggle.spec()
         config.hotkey_hide = self._cap_hide.spec()
         config.hotkey_restore = self._cap_restore.spec()
+        config.hotkey_toggle_mouse = self._cap_toggle_mouse.spec()
+        config.hotkey_hide_mouse = self._cap_hide_mouse.spec()
+        config.hotkey_restore_mouse = self._cap_restore_mouse.spec()
         config.hotkey_hide_self = self._cap_self.spec()
         config.mute_on_hide = self._cb_mute.isChecked()
         config.keep_hidden = self._cb_keep.isChecked()

@@ -426,12 +426,17 @@ class MainWindow(QMainWindow):
         # toggle 模式:一个键反复切换;split 模式:隐藏键 + 恢复键分开。
         # 另有一个"隐藏本工具"(收进托盘),与模式无关,始终注册。
         specs = {"hide_self": (c.hotkey_hide_self.mods, c.hotkey_hide_self.vk)}
+        mouse: dict[str, int] = {}
         if c.hotkey_mode == "split":
             specs["hide"] = (c.hotkey_hide.mods, c.hotkey_hide.vk)
             specs["restore"] = (c.hotkey_restore.mods, c.hotkey_restore.vk)
+            mouse["hide"] = c.hotkey_hide_mouse.vk
+            mouse["restore"] = c.hotkey_restore_mouse.vk
         else:
             specs["toggle"] = (c.hotkey_toggle.mods, c.hotkey_toggle.vk)
-        self._hotkeys.set_hotkeys(specs)
+            mouse["toggle"] = c.hotkey_toggle_mouse.vk
+        # 键盘组合与鼠标侧键**并存**:手在哪边用哪边
+        self._hotkeys.set_hotkeys(specs, mouse)
 
     # ---------------------------------------------------------------- 信号
     def _on_hotkey(self, action: str) -> None:

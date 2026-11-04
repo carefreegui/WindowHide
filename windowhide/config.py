@@ -23,6 +23,13 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 
+# 鼠标侧键的伪键码。真实虚拟键码(VK)最大 0xFE,所以 0x100 以上不会冲突;
+# 存进配置就是普通整数,旧版本读到这种值只会当成"不认识的热键"忽略,不会崩。
+# 侧键不需要(也不能)带修饰符 —— 你没法"按住 Ctrl 再按侧键"。
+VK_XBUTTON1 = 0x100   # 浏览器里的「后退」键(靠拇指前面那个)
+VK_XBUTTON2 = 0x101   # 浏览器里的「前进」键
+MOUSE_VKS = frozenset({VK_XBUTTON1, VK_XBUTTON2})
+
 CONFIG_VERSION = 2
 DEFAULT_PROFILE = "默认"
 
@@ -46,7 +53,13 @@ class HotkeySpec:
 
     @property
     def valid(self) -> bool:
-        return self.vk != 0 and (self.mods & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN)) != 0
+        if not self.vk:
+            return False
+        # 鼠标侧键本身就是"一个按键",没有修饰符可用 —— 这里必须放行,
+        # 否则录进来的侧键会被当成无效配置直接丢掉,用户表现为"设了没反应"。
+        if self.vk in MOUSE_VKS:
+            return True
+        return (self.mods & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN)) != 0
 
     def to_dict(self) -> dict:
         return {"mods": self.mods, "vk": self.vk}
@@ -128,6 +141,12 @@ class Config:
     hotkey_toggle: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x48))  # Ctrl+Alt+H
     hotkey_hide: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x48))    # Ctrl+Alt+H
     hotkey_restore: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x53)) # Ctrl+Alt+S
+    # 附加的鼠标侧键:和上面的键盘组合**同时**生效,不是二选一。
+    # 手在鼠标上就按侧键,手在键盘上就按组合键 —— 老板键的触发时机往往是
+    # 一瞬间的事,少一次"手从哪移到哪"就少一次被看见的机会。
+    hotkey_toggle_mouse: HotkeySpec = field(default_factory=HotkeySpec)
+    hotkey_hide_mouse: HotkeySpec = field(default_factory=HotkeySpec)
+    hotkey_restore_mouse: HotkeySpec = field(default_factory=HotkeySpec)
     # "隐藏本工具":把主窗口收进托盘(不是藏别人窗口 —— 曾按"隐藏前台窗口"
     # 实现,那个语义只会误伤,已按用户反馈改为工具自藏)
     hotkey_hide_self: HotkeySpec = field(default_factory=lambda: HotkeySpec(MOD_CONTROL | MOD_ALT, 0x51))  # Ctrl+Alt+Q
@@ -235,6 +254,9 @@ class Config:
             "hotkey_toggle": self.hotkey_toggle.to_dict(),
             "hotkey_hide": self.hotkey_hide.to_dict(),
             "hotkey_restore": self.hotkey_restore.to_dict(),
+            "hotkey_toggle_mouse": self.hotkey_toggle_mouse.to_dict(),
+            "hotkey_hide_mouse": self.hotkey_hide_mouse.to_dict(),
+            "hotkey_restore_mouse": self.hotkey_restore_mouse.to_dict(),
             "hotkey_hide_self": self.hotkey_hide_self.to_dict(),
             "mute_on_hide": self.mute_on_hide,
             "keep_hidden": self.keep_hidden,
@@ -261,7 +283,8 @@ class Config:
         # 之类的地方拿到意料之外的值
         c.hotkey_mode = mode if isinstance(mode, str) else "toggle"
         for key in ("hotkey_toggle", "hotkey_hide", "hotkey_restore",
-                    "hotkey_hide_self"):
+                    "hotkey_hide_self", "hotkey_toggle_mouse",
+                    "hotkey_hide_mouse", "hotkey_restore_mouse"):
             if key in d and isinstance(d[key], dict):
                 setattr(c, key, HotkeySpec.from_dict(d[key]))
         # 兼容:v1 的"隐藏前台窗口"快捷键改名为"隐藏本工具"
