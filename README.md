@@ -89,7 +89,7 @@ Python / PySide6。首次启动约 2 秒(单文件要先解包到 `%TEMP%`)。
 ```bat
 .venv\Scripts\pip install pyinstaller
 .venv\Scripts\python tools\build_exe.py
-:: 产物:dist\WindowHide.exe(约 46 MB)
+:: 产物:dist\WindowHide.exe(约 27 MB)
 ```
 
 > 首次运行 Windows 可能弹「已保护你的电脑」(SmartScreen)—— 这是所有
@@ -247,11 +247,15 @@ windowhide/
   先解包(约 2 秒)。
 - **manifest 用 `asInvoker`**:故意不默认要求管理员 —— 否则"藏个普通程序"
   每次都弹 UAC;要管管理员程序时走托盘里的「以管理员身份重启」。
-- **图标资源**:`--add-data` 把 `windowhide/assets` 打进包里,运行时按
-  `sys._MEIPASS` 找(`ui/icon.py` 的 `asset_dir()`)。
-- **体积裁剪**:排除掉用不到的 Qt 模块(QtWebEngine/QtQuick/Qt3D…),
-  150MB+ 压到 46MB。改排除表之后**必须真跑一次 exe** —— 有些模块是被
-  Qt 插件反向依赖的,排掉后启动就崩,而打包过程不会有任何提示。
+- **图标资源**:`windowhide/assets` 被打进包里,运行时按 `sys._MEIPASS` 找
+  (`ui/icon.py` 的 `asset_dir()`)。
+- **体积裁剪**:PySide6 完整装下来 150 MB+。排除表在 `WindowHide.spec` 里,
+  分两层:①`--exclude-module` 排 Python 绑定;②过滤 `a.binaries` 排 DLL
+  (命令行参数**没法**过滤二进制,所以必须有 spec)。主要砍掉 opengl32sw.dll
+  (19.7 MB 的软件 OpenGL 兜底)、Qt6Quick/Qml(12.8 MB)、Qt6Pdf、Qt6Network、
+  以及除 png/ico 之外的图片插件 —— 47.8 MB → 27.2 MB。
+  改过滤表之后**必须真跑一次 exe**:有些模块是被 Qt 插件反向依赖的,排掉后
+  启动就崩,而打包过程不会有任何提示。
 
 ### 更多
 

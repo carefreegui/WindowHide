@@ -12,7 +12,7 @@ windowhide.log
 # 打包产物
 build/
 dist/
-*.spec
+# 注意:WindowHide.spec 是**手工维护**的(要过滤二进制),不要忽略它
 
 # 编辑器
 .idea/
