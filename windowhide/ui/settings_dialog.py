@@ -15,6 +15,7 @@ from ..config import (Config, MUTE_ALWAYS, MUTE_INHERIT,
                       MUTE_MODE_LABELS, MUTE_MODES, Profile)
 from ..core.protect import BUILTIN
 from ..core.targets import TargetRule
+from ..core.hotkeys import reset_capture
 from .hotkey_edit import HotkeyCaptureButton
 
 
@@ -56,13 +57,48 @@ class SettingsDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         ok = QPushButton("保存")
-        ok.setDefault(True)
+        ok.setDefault(True)      # Enter 保存是本来的习惯,留着
         cancel = QPushButton("取消")
+        # 取消按钮不能"一有焦点就被 Enter 点掉":老 Qt 的 autoDefault 默认
+        # 开启,用户在设置页里随手按个回车,整份改动就没了。
+        cancel.setAutoDefault(False)
         ok.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
         buttons.addWidget(ok)
         buttons.addWidget(cancel)
         layout.addLayout(buttons)
+
+    def _capture_buttons(self) -> tuple:
+        """所有"等待按键"的按钮。用 getattr 兜底:_build 中途失败时也得能收尾。"""
+        return tuple(
+            b for b in (getattr(self, name, None) for name in (
+                "_cap_toggle", "_cap_hide", "_cap_restore",
+                "_cap_toggle_mouse", "_cap_hide_mouse", "_cap_restore_mouse",
+                "_cap_self")) if b is not None)
+
+    def done(self, result: int) -> None:
+        """对话框关掉的唯一出口,在这里无条件把捕获态收干净。
+
+        🔴 这是全项目最重要的一次收尾。用户踩过:录入到一半按 Esc / 点取消,
+        对话框直接 reject,按钮的 `_end_capture()` 根本没机会跑,全局捕获
+        标志就永久停在 True —— 之后所有鼠标侧键热键全部失灵(钩子以为还在
+        录入,只往界面发信号、不触发动作),而用户完全看不出这是"设置窗口
+        的残留状态"。他重启程序才好。
+
+        `done()` 是所有路径的必经之路:保存(accept)、取消(reject)、Esc、
+        右上角叉、程序主动关。放在这里才谈得上"保证"。
+        """
+        for cap in self._capture_buttons():
+            cap._end_capture()
+        reset_capture()
+        # 兜底:极端情况下(press 之后窗口就被关掉)Qt 可能还攥着鼠标。
+        # `SetCapture` 泄漏的表现非常吓人 —— 鼠标点桌面上任何东西都没反应,
+        # 键盘却一切正常,用户会以为整台电脑坏了。没抓着的时候这里是空操作。
+        try:
+            self.releaseMouse()
+        except Exception:
+            pass
+        super().done(result)
 
     def _hotkey_tab(self) -> QWidget:
         w = QWidget()
@@ -140,6 +176,10 @@ class SettingsDialog(QDialog):
         tip = QLabel("「隐藏本工具」= 把本工具主窗口收进系统托盘(不是藏别人窗口),"
                      "与点右上角叉号等效;双击托盘图标可唤回。\n"
                      "全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。\n\n"
+                     "为什么必须带 Ctrl / Alt / Win:全局快捷键在系统里是"
+                     "「独占」的 —— 一旦生效,这个组合在别的程序里就再也不能用了。"
+                     "Shift+Enter 是聊天换行、Shift+字母是大写、Shift+数字是符号,"
+                     "这类组合本工具会直接拒绝(不是坏了),否则整台电脑的键盘会像坏了一样。\n\n"
                      "鼠标侧键:点右边那一格,然后直接按侧键。键盘组合键和侧键"
                      "各一个,同时生效 —— 手在哪边就用哪边。\n"
                      "注意:设成快捷键的那个侧键,以后在浏览器里不再「前进/后退」"

@@ -36,6 +36,11 @@ from .win32 import (
 WM_APP = 0x8000
 MSG_STRING_SIZE = 256
 
+# 低级鼠标钩子出意外的次数。到了阈值就把回调变成"只转发"——见 mouse_proc
+# 里的注释:这条链上宁可功能废掉,也不能让整台机器的输入受影响。
+_hook_errors = 0
+HOOK_ERROR_LIMIT = 30
+
 
 class WNDCLASS(ctypes.Structure):
     _fields_ = [
@@ -83,6 +88,13 @@ for _i in range(0x41, 0x5B):
 for _i in range(0x30 + 0x30, 0x3A + 0x30):
     VK_NAMES[_i] = f"Numpad{_i - 0x30}"
 
+# 符号键。VK_OEM_* 不是 ASCII —— 0xDB 是「[」而不是 0x5B,少了这张表
+# 用户设了 Ctrl+[ 之后按钮会显示成一串十六进制,看着像没识别。
+VK_NAMES.update({
+    0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".",
+    0xBF: "/", 0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
+})
+
 # 鼠标侧键。名字带括号是给用户看的:多数人不知道"侧键"在浏览器里
 # 默认干的是前进/后退,不写出来他不会意识到设置后这个功能会失效。
 VK_NAMES[VK_XBUTTON1] = "鼠标侧键 1(后退键)"
@@ -110,25 +122,103 @@ class _CaptureBus(QObject):
     用户永远没法把侧键从 A 改成 B。
     """
     captured = Signal(int)   # 侧键的伪 VK
+    # 新按钮开始录入时广播,让还在等按键的旧按钮自己退出。
+    # 不广播的话:用户点 A 再点 B,A 没收到 focusOut 就一直挂在"请按键",
+    # 而全局账本只认最后那个人 —— 界面显示和实际状态就对不上了
+    # (用户原话:"有时候能点,有时候点不了")。
+    #
+    # 参数类型必须是 **object** 而不是 int:传的是 `id(按钮)`,64 位下
+    # 轻松超过 2^31,而 PySide6 的 `Signal(int)` 是 C++ 的 32 位 int ——
+    # 溢出后整条信号链报 SystemError,槽函数静默不执行(调试时非常难看出
+    # 是"类型不匹配"还是"逻辑没写对")。
+    owner_changed = Signal(object)   # 新 owner 的 id(按钮的 id(self))
 
 
 capture_bus = _CaptureBus()
 
-# 捕获态用 Event 而不是布尔:钩子在线程里读,界面在主线程写,得是原子的。
-# 不加锁读取(Event.is_set 自带锁),也不会阻塞钩子回调。
-_capturing = threading.Event()
+# ---------------------------------------------------------------------------
+# 捕获态账本
+#
+# 曾经这里只有一个布尔 `_capturing`。它有两个致命问题,都是用户实机踩出来的:
+#
+# 1. **多按钮互相踩**:设置页上有 6 个录入按钮(切换/隐藏/恢复 × 键盘/侧键)。
+#    用户点 A 再点 B,A 未必收到 focusOut,于是 A 的 `_end_capture()` 不会执行,
+#    而 B 的 `set_capturing(False)` 又会把 A 的捕获状态一起清掉 —— 表现为
+#    "有时候能点有时候点不了"。改成登记表:谁进谁登记,谁退谁销自己那一条,
+#    最后一个退出的人才真正关掉标志。
+#
+# 2. **对话框一关就永远卡住**:用户录入到一半按 Esc / 点取消,对话框走
+#    `QDialog::reject()` 直接关掉,按钮的 `_end_capture()` 根本没机会跑,
+#    标志就永久停在 True。之后所有侧键热键全部失效(钩子以为还在录入,
+#    只发信号不触发动作)。所以这里再加一条**超时自愈**:超过
+#    `CAPTURE_MAX_SECONDS` 没人来销账,就当它没发生过。
+_capturing = threading.Event()        # 快路径:钩子回调直接读这个
+_capture_owners: set[int] = set()     # 谁在等按键(按钮用 id(self))
+_capture_lock = threading.Lock()
+_capture_deadline = 0.0               # monotonic 时间戳
+CAPTURE_MAX_SECONDS = 120.0           # 忘了退出就自动失效,不用重启程序
+
+_ANON_OWNER = 0                       # 没有 owner 的兼容调用(set_capturing)
 
 
-def set_capturing(on: bool) -> None:
-    """界面进入/退出"等待按键"状态时调用。"""
-    if on:
+def _capture_active() -> bool:
+    """钩子回调里调用的版本:绝不拿锁、绝不阻塞。
+
+    过期判断放在这里而不是单独开个定时器:平时 `_capturing` 是 False,
+    第一行就返回了;只有真在录入时才多一次 `time.monotonic()` 比较。
+    """
+    if not _capturing.is_set():
+        return False
+    if time.monotonic() > _capture_deadline:
+        # 过期。这里不能拿锁(钩子回调阻塞 = 全系统输入卡顿),所以只清
+        # 快路径标志,账本留给下一次 begin/end 顺手清。
+        _capturing.clear()
+        return False
+    return True
+
+
+def begin_capture(owner: int) -> None:
+    """登记"我在等按键"。owner 用 `id(按钮)`,每个按钮独立一条。"""
+    global _capture_deadline
+    with _capture_lock:
+        _capture_owners.add(owner)
+        _capture_deadline = time.monotonic() + CAPTURE_MAX_SECONDS
         _capturing.set()
-    else:
+
+
+def end_capture(owner: int) -> None:
+    """销自己那一条;还有别人在等就保持捕获态。"""
+    with _capture_lock:
+        _capture_owners.discard(owner)
+        if not _capture_owners:
+            _capturing.clear()
+
+
+def reset_capture() -> None:
+    """无条件清空。设置对话框关闭时必须调这个 —— 那是唯一能保证
+    "不管里面发生过多乱的事,出门时一定是干净的"的地方。"""
+    with _capture_lock:
+        _capture_owners.clear()
         _capturing.clear()
 
 
+def set_capturing(on: bool) -> None:
+    """兼容旧接口(测试与外部调用)。没有 owner,一律走空账。"""
+    if on:
+        begin_capture(_ANON_OWNER)
+    else:
+        reset_capture()
+
+
 def is_capturing() -> bool:
-    return _capturing.is_set()
+    return _capture_active()
+
+
+def capture_owners() -> int:
+    """当前有几个按钮在等按键(诊断用)。"""
+    with _capture_lock:
+        return len(_capture_owners)
+
 
 
 def hotkey_label(mods: int, vk: int) -> str:
@@ -284,30 +374,53 @@ class HotkeyManager(QObject):
         hook_proc = None
 
         def mouse_proc(ncode, wparam, lparam):
-            # 快路径:不是侧键就立刻走人。装了钩子之后**每个**鼠标事件
-            # (移动、滚轮、左右键)都会进这里,这一行必须最省。
-            if ncode == HC_ACTION and (wparam == WM_XBUTTONDOWN
-                                       or wparam == WM_XBUTTONUP):
-                btn = xbutton_of(lparam)
-                vk = (VK_XBUTTON1 if btn == XBUTTON1
-                      else VK_XBUTTON2 if btn == XBUTTON2 else 0)
-                if vk:
-                    if is_capturing():
-                        # 正在录入新热键:放行,只把"按下"转给界面。
-                        # 不这样的话钩子会吃掉自己的输入 —— 侧键设成 A
-                        # 之后就再也改不成 B 了。
-                        if wparam == WM_XBUTTONDOWN:
-                            capture_bus.captured.emit(vk)
-                    else:
-                        action = mouse_map.get(vk)
-                        if action:
+            global _hook_errors
+            # 🔴 这个函数挂在系统**输入链**上。它慢 1ms,整台机器的鼠标就慢
+            # 1ms;它抛异常,后果不是"这个功能不好用",而是用户觉得鼠标坏了
+            # —— 用户实机踩过:设置里乱按一通之后,鼠标点桌面上任何东西都
+            # 没反应,只剩 Win+D 还能用(键盘不走这条链)。
+            #
+            # 所以:整段 try/except,任何意外都当"放行";另外计数,坏到一定
+            # 次数就**自我阉割**(只转发、什么都不做)——侧键功能废掉,但系统
+            # 一定保住。这个取舍没有第二种选择。
+            try:
+                if _hook_errors < HOOK_ERROR_LIMIT and ncode == HC_ACTION and (
+                        wparam == WM_XBUTTONDOWN or wparam == WM_XBUTTONUP):
+                    btn = xbutton_of(lparam)
+                    vk = (VK_XBUTTON1 if btn == XBUTTON1
+                          else VK_XBUTTON2 if btn == XBUTTON2 else 0)
+                    if vk:
+                        if _capture_active():
+                            # 正在录入新热键:放行,只把"按下"转给界面。
+                            # 不这样的话钩子会吃掉自己的输入 —— 侧键设成 A
+                            # 之后就再也改不成 B 了。
                             if wparam == WM_XBUTTONDOWN:
-                                self.triggered.emit(action)
-                            # 吃掉。DOWN 和 UP 都得拦:只拦 DOWN 会让浏览器
-                            # 收到一个没有配对的孤儿 UP,个别程序会卡在
-                            # "按住"状态。
-                            return 1
+                                capture_bus.captured.emit(vk)
+                        else:
+                            action = mouse_map.get(vk)
+                            if action:
+                                if wparam == WM_XBUTTONDOWN:
+                                    self.triggered.emit(action)
+                                # 吃掉。DOWN 和 UP 都得拦:只拦 DOWN 会让浏览器
+                                # 收到一个没有配对的孤儿 UP,个别程序会卡在
+                                # "按住"状态。
+                                return 1
+            except Exception as exc:            # noqa: BLE001 - 宁可吞掉
+                _hook_errors += 1
+                if _hook_errors <= 3:
+                    try:
+                        write(f"鼠标钩子回调异常({_hook_errors}/{HOOK_ERROR_LIMIT}),"
+                              f"已按放行处理: {exc!r}")
+                    except Exception:
+                        pass
+                elif _hook_errors == HOOK_ERROR_LIMIT:
+                    try:
+                        write("鼠标钩子异常过多,已自我停用(放行所有鼠标事件)。"
+                              "侧键热键将不再响应,其它功能不受影响。")
+                    except Exception:
+                        pass
             return CallNextHookEx(0, ncode, wparam, lparam)
+
 
         hook_err = 0
         try:

@@ -46,20 +46,44 @@ MUTE_MODE_LABELS = {
 }
 
 
+# 全局热键的"安全修饰键"。
+#
+# 这是硬约束,不是偏好:`RegisterHotKey` 一旦注册成功,这个组合在**全系统**
+# 就被本程序截胡了 —— 文字输入、换行、公式填充统统失灵,而且用户很难想到
+# 是一个后台小工具干的。只有带 Ctrl/Alt/Win 的组合才安全,因为这些组合
+# 本来就不是任何程序的输入刚需,用户主动设了就是明确表达"我要这个"。
+#
+# MOD_SHIFT **不算**安全:Shift+Enter 是聊天软件换行、Shift+字母是大写、
+# Shift+数字是符号。曾经真的让用户把 Shift+Enter 存成了老板键,结果整个
+# 键盘的换行和符号输入都"像坏了一样"。
+SAFE_MODS = MOD_ALT | MOD_CONTROL | MOD_WIN
+
+
 @dataclass(slots=True)
 class HotkeySpec:
     mods: int = 0
     vk: int = 0
 
     @property
+    def is_mouse(self) -> bool:
+        return self.vk in MOUSE_VKS
+
+    @property
+    def safe(self) -> bool:
+        """这个组合会不会把全系统的正常输入吃掉。"""
+        # 鼠标侧键本身就是"一个按键",没有修饰符可用 —— 必须放行,
+        # 否则录进来的侧键会被当成无效配置直接丢掉(用户表现为"设了没反应")
+        if self.is_mouse:
+            return True
+        if not self.vk:
+            return True          # 没设置 = 不注册,谈不上危险
+        return (self.mods & SAFE_MODS) != 0
+
+    @property
     def valid(self) -> bool:
         if not self.vk:
             return False
-        # 鼠标侧键本身就是"一个按键",没有修饰符可用 —— 这里必须放行,
-        # 否则录进来的侧键会被当成无效配置直接丢掉,用户表现为"设了没反应"。
-        if self.vk in MOUSE_VKS:
-            return True
-        return (self.mods & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN)) != 0
+        return self.safe
 
     def to_dict(self) -> dict:
         return {"mods": self.mods, "vk": self.vk}
@@ -67,6 +91,20 @@ class HotkeySpec:
     @classmethod
     def from_dict(cls, d: dict) -> "HotkeySpec":
         return cls(mods=int(d.get("mods", 0)), vk=int(d.get("vk", 0)))
+
+
+def _spec_text(spec: HotkeySpec) -> str:
+    """压成能进日志的短文本。不依赖 UI 模块 —— config 是底层,不能反过来
+    引用 hotkeys.py(那会形成循环导入)。键名用十六进制,查起来也不难。"""
+    if not spec or not spec.vk:
+        return "未设置"
+    if spec.vk in MOUSE_VKS:
+        return "鼠标侧键1" if spec.vk == VK_XBUTTON1 else "鼠标侧键2"
+    parts = [name for bit, name in ((MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"),
+                                    (MOD_SHIFT, "Shift"), (MOD_WIN, "Win"))
+             if spec.mods & bit]
+    parts.append(f"0x{spec.vk:02X}")
+    return "+".join(parts)
 
 
 @dataclass(slots=True)
@@ -344,6 +382,33 @@ class Config:
         except OSError:
             pass
 
+    # ------------------------------------------------------------ 热键自愈
+    _HOTKEY_FIELDS = (
+        "hotkey_toggle", "hotkey_hide", "hotkey_restore", "hotkey_hide_self",
+        "hotkey_toggle_mouse", "hotkey_hide_mouse", "hotkey_restore_mouse",
+    )
+
+    def repair_unsafe_hotkeys(self) -> list[tuple[str, HotkeySpec, HotkeySpec]]:
+        """把会吃掉全系统输入的组合换回安全默认值,返回 (字段, 旧值, 新值)。
+
+        为什么必须在**加载时**修,而不是只在录入时拦:
+        老配置里可能已经躺着 Shift+Enter(用户就是这么踩的)。程序每次启动
+        都会照着它去 RegisterHotKey —— 一开机就把整个系统的"换行"和
+        "打符号"抢走,而这时候用户根本不在设置界面,连是哪个软件干的都
+        想不到。自愈一次,代价是用户换回默认键;不自愈,代价是他以为
+        电脑坏了。
+        """
+        defaults = type(self)()
+        broken: list[tuple[str, HotkeySpec, HotkeySpec]] = []
+        for key in self._HOTKEY_FIELDS:
+            spec = getattr(self, key, None)
+            if not isinstance(spec, HotkeySpec) or spec.safe:
+                continue
+            new = getattr(defaults, key)
+            broken.append((key, spec, HotkeySpec(mods=new.mods, vk=new.vk)))
+            setattr(self, key, HotkeySpec(mods=new.mods, vk=new.vk))
+        return broken
+
     @classmethod
     def load(cls) -> "Config":
         path = app_dir() / "config.json"
@@ -354,6 +419,13 @@ class Config:
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
         cfg = cls.from_dict(raw)
+        broken = cfg.repair_unsafe_hotkeys()
+        if broken:
+            from .log import write
+            write("已自动修正危险热键(这类组合会抢走全系统的输入,不该当全局热键): "
+                  + ", ".join(f"{k}={_spec_text(old)}→{_spec_text(new)}"
+                              for k, old, new in broken))
+            cfg.save()
         try:
             version = int(raw.get("version") or 1)
         except (TypeError, ValueError):

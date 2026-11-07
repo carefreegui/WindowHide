@@ -423,18 +423,33 @@ class MainWindow(QMainWindow):
 
     def _apply_hotkeys(self) -> None:
         c = self._config
+        # 注册前最后一道闸:不安全的组合一律按"未设置"处理,宁可没热键,
+        # 也不能把全系统的输入抢走。config 加载时已经自愈过一次,这里防的是
+        # 内存里被别处改脏(以及"用户手工编辑 config.json"这条路)。
+        unsafe = []
+
+        def pair(spec):
+            if not spec.safe:
+                unsafe.append(spec)
+                return 0, 0
+            return spec.mods, spec.vk
+
         # toggle 模式:一个键反复切换;split 模式:隐藏键 + 恢复键分开。
         # 另有一个"隐藏本工具"(收进托盘),与模式无关,始终注册。
-        specs = {"hide_self": (c.hotkey_hide_self.mods, c.hotkey_hide_self.vk)}
+        specs = {"hide_self": pair(c.hotkey_hide_self)}
         mouse: dict[str, int] = {}
         if c.hotkey_mode == "split":
-            specs["hide"] = (c.hotkey_hide.mods, c.hotkey_hide.vk)
-            specs["restore"] = (c.hotkey_restore.mods, c.hotkey_restore.vk)
+            specs["hide"] = pair(c.hotkey_hide)
+            specs["restore"] = pair(c.hotkey_restore)
             mouse["hide"] = c.hotkey_hide_mouse.vk
             mouse["restore"] = c.hotkey_restore_mouse.vk
         else:
-            specs["toggle"] = (c.hotkey_toggle.mods, c.hotkey_toggle.vk)
+            specs["toggle"] = pair(c.hotkey_toggle)
             mouse["toggle"] = c.hotkey_toggle_mouse.vk
+        if unsafe:
+            from ..log import write
+            write(f"拒绝注册 {len(unsafe)} 个危险热键(纯 Shift 组合会抢走"
+                  f"换行/大写/符号输入),已按未设置处理")
         # 键盘组合与鼠标侧键**并存**:手在哪边用哪边
         self._hotkeys.set_hotkeys(specs, mouse)
 

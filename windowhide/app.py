@@ -109,7 +109,17 @@ def main() -> int:
 
     window = MainWindow(config, controller, hotkeys, tray)
     window.register_show_me()
-    window._apply_hotkeys()
+    # --safe:不注册任何全局热键、不装鼠标钩子。
+    #
+    # 这是**排查/自救**用的,不是给日常用的。全局热键和低级鼠标钩子都是
+    # 系统级的东西:一旦有哪个环节不对,用户感受到的不是"这个软件不好用",
+    # 而是"我电脑的键盘/鼠标坏了",而且完全想不到是谁干的。留一个干净的
+    # 启动方式,至少能一句话把嫌疑排除掉。
+    if "--safe" in sys.argv:
+        from .log import write
+        write("安全模式启动:未注册全局热键,未安装鼠标钩子")
+    else:
+        window._apply_hotkeys()
     window.show()
 
     if config.autostart:
