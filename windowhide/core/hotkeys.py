@@ -221,6 +221,33 @@ def capture_owners() -> int:
 
 
 
+def side_button_decision(wparam: int, vk: int, *, capturing: bool,
+                         has_action: bool, paired: dict[int, bool]
+                         ) -> tuple[bool, str]:
+    """决定一个鼠标侧键事件该放行还是吃掉。纯函数,方便把时序钉死。
+
+    返回 (是否吃掉, 副作用),副作用是 "" / "trigger" / "capture"。
+
+    **`paired` 必须由调用方跨事件持有**,这是这个函数存在的全部理由:
+    侧键的 DOWN 和 UP 是一对,处理方式必须一致。以前每个事件都重新判
+    "现在是不是录入态" —— 用户在录入态按下(DOWN 放行),界面在 DOWN 的
+    回调里就退出了录入态,手指抬起时钩子看到"不在录入态",就把这个 UP
+    当成热键尾巴吃掉。Qt 永远收不到 release,按键状态 + 隐式 SetCapture
+    一起卡死:鼠标点哪都没反应,只有本程序的窗口能点。
+    """
+    if wparam == WM_XBUTTONDOWN:
+        if capturing:
+            paired[vk] = False           # 放行了,抬起也得放
+            return False, "capture"
+        if has_action:
+            paired[vk] = True            # 吃掉了,抬起也得吃
+            return True, "trigger"
+        paired.pop(vk, None)             # 这个键我们不管
+        return False, ""
+    # WM_XBUTTONUP:只认 DOWN 时记下的答案,**绝不重新判断**
+    return (paired.pop(vk, None) is True), ""
+
+
 def hotkey_label(mods: int, vk: int) -> str:
     """格式化为 'Ctrl + Alt + H' / '鼠标侧键 1(后退键)'。"""
     if not vk:
@@ -373,6 +400,20 @@ class HotkeyManager(QObject):
         hook_id = 0
         hook_proc = None
 
+        # 侧键的按下/抬起**必须成对处理**。
+        #
+        # 🔴 这里踩过最严重的一次:用户实机稳定复现"设置完侧键之后鼠标点哪
+        # 都没反应,只有本工具的窗口能点"。
+        #
+        # 机制:在录入态按下侧键,DOWN 被放行 → 界面在 DOWN 里就退出了录入态
+        # → 手指抬起时钩子重新判 `_capture_active()` 已经是 False → 走"热键"
+        # 分支 → 这个 UP 被 `return 1` 吃掉。Qt 永远收不到 BackButton 的
+        # release,按键状态和隐式 SetCapture 一起卡死 —— 所有鼠标事件都被
+        # 强行发给本线程的窗口,点桌面/任务管理器全无反应。
+        #
+        # 修复只有一条路:DOWN 怎么处理,UP 就怎么处理。用一张表记着。
+        down_action: dict[int, bool] = {}    # vk -> 这个 DOWN 是否被吃掉
+
         def mouse_proc(ncode, wparam, lparam):
             global _hook_errors
             # 🔴 这个函数挂在系统**输入链**上。它慢 1ms,整台机器的鼠标就慢
@@ -390,21 +431,19 @@ class HotkeyManager(QObject):
                     vk = (VK_XBUTTON1 if btn == XBUTTON1
                           else VK_XBUTTON2 if btn == XBUTTON2 else 0)
                     if vk:
-                        if _capture_active():
-                            # 正在录入新热键:放行,只把"按下"转给界面。
-                            # 不这样的话钩子会吃掉自己的输入 —— 侧键设成 A
-                            # 之后就再也改不成 B 了。
-                            if wparam == WM_XBUTTONDOWN:
-                                capture_bus.captured.emit(vk)
-                        else:
-                            action = mouse_map.get(vk)
-                            if action:
-                                if wparam == WM_XBUTTONDOWN:
-                                    self.triggered.emit(action)
-                                # 吃掉。DOWN 和 UP 都得拦:只拦 DOWN 会让浏览器
-                                # 收到一个没有配对的孤儿 UP,个别程序会卡在
-                                # "按住"状态。
-                                return 1
+                        # 捕获态只在 DOWN 时问一次(UP 不该重新判断,见函数注释)
+                        capture_now = (wparam == WM_XBUTTONDOWN
+                                       and _capture_active())
+                        eat, effect = side_button_decision(
+                            wparam, vk, capturing=capture_now,
+                            has_action=bool(mouse_map.get(vk)),
+                            paired=down_action)
+                        if effect == "capture":
+                            capture_bus.captured.emit(vk)
+                        elif effect == "trigger":
+                            self.triggered.emit(mouse_map[vk])
+                        if eat:
+                            return 1
             except Exception as exc:            # noqa: BLE001 - 宁可吞掉
                 _hook_errors += 1
                 if _hook_errors <= 3:

@@ -1203,3 +1203,38 @@ def xbutton_of(lparam: int) -> int:
     data = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
     n = (int(data.mouseData) >> 16) & 0xFFFF
     return n if n in (XBUTTON1, XBUTTON2) else 0
+
+
+# 鼠标捕获的应急释放。
+#
+# **为什么必须直接调 Win32,而不是 Qt 的 `QWidget.releaseMouse()`**:
+# `releaseMouse()` 只释放通过 `grabMouse()` 拿到的**显式**捕获。
+# 真正卡住用户鼠标的是平台层的**隐式** SetCapture(Qt 在收到任何按下时
+# 自己调的那个),它只认 `ReleaseCapture`。
+#
+# 不释放会怎样:所有鼠标消息都发给本进程的某个窗口,用户点桌面、点任务
+# 管理器全都没反应,只剩下那个窗口还能点 —— 看着就像"电脑鼠标坏了"。
+ReleaseCapture = user32.ReleaseCapture
+ReleaseCapture.argtypes = []
+ReleaseCapture.restype = wintypes.BOOL
+
+# 当前线程正持有鼠标捕获的窗口句柄;没有捕获返回 0。
+#
+# 判"捕获是不是泄漏了",这个比问 Qt 准:Qt 的 `mouseButtons()` 可能已经
+# 自己清干净了,而系统层的 SetCapture 还挂着 —— 那种情况下 Qt 看起来一切
+# 正常,用户却点哪都没反应。
+GetCapture_ = user32.GetCapture
+GetCapture_.argtypes = []
+GetCapture_.restype = wintypes.HWND
+
+# 物理按键的真实状态。用来判断"Qt 说按着、系统说没按"这种卡死。
+# 顺序:左、右、中、侧键1、侧键2
+_MOUSE_BUTTON_VKS = (0x01, 0x02, 0x04, 0x05, 0x06)
+GetAsyncKeyState = user32.GetAsyncKeyState
+GetAsyncKeyState.argtypes = [ctypes.c_int]
+GetAsyncKeyState.restype = ctypes.c_short
+
+
+def any_mouse_button_physically_down() -> bool:
+    """有没有任何一个鼠标按键**真的**被按着(问系统,不问 Qt)。"""
+    return any(GetAsyncKeyState(vk) & 0x8000 for vk in _MOUSE_BUTTON_VKS)

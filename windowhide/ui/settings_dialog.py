@@ -16,6 +16,7 @@ from ..config import (Config, MUTE_ALWAYS, MUTE_INHERIT,
 from ..core.protect import BUILTIN
 from ..core.targets import TargetRule
 from ..core.hotkeys import reset_capture
+from ..core.win32 import ReleaseCapture
 from .hotkey_edit import HotkeyCaptureButton
 
 
@@ -91,11 +92,20 @@ class SettingsDialog(QDialog):
         for cap in self._capture_buttons():
             cap._end_capture()
         reset_capture()
-        # 兜底:极端情况下(press 之后窗口就被关掉)Qt 可能还攥着鼠标。
-        # `SetCapture` 泄漏的表现非常吓人 —— 鼠标点桌面上任何东西都没反应,
-        # 键盘却一切正常,用户会以为整台电脑坏了。没抓着的时候这里是空操作。
+        # 兜底:把鼠标捕获放干净。
+        #
+        # 两件事分开做,因为它们是两层机制:
+        # · `releaseMouse()` 只放 Qt 自己的**显式**捕获(grabMouse);
+        # · 真正卡住用户鼠标的是平台层的**隐式** SetCapture,只认 Win32 的
+        #   `ReleaseCapture()`。
+        # 漏了后者的表现是:鼠标点桌面上任何东西都没反应,只有本工具的
+        # 窗口还能点,连任务管理器都点不动 —— 用户会以为电脑坏了。
         try:
             self.releaseMouse()
+        except Exception:
+            pass
+        try:
+            ReleaseCapture()
         except Exception:
             pass
         super().done(result)

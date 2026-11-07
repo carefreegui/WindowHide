@@ -135,6 +135,53 @@ class MainWindow(QMainWindow):
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.profile_menu.aboutToShow.connect(self._rebuild_tray_profiles)
 
+        self._start_mouse_guard()
+
+    # ------------------------------------------------------------ 鼠标守护
+    def _start_mouse_guard(self) -> None:
+        """每秒查一次:Qt 认为鼠标按着、系统却说没按 → 强制释放捕获。
+
+        真实事故:录入侧键时钩子吃掉了 UP,Qt 的按键状态和隐式 SetCapture
+        一起卡死——之后鼠标点任何地方都没反应,只有本窗口能点,连任务管理器
+        都点不动,用户只能重启。根因已经修了(DOWN/UP 配对),但这类
+        "系统级输入卡死"只要复发一次就够劝退,所以再加一道自动解开。
+
+        判据必须两边都问:只看 Qt 会在用户真的按住鼠标时误释放(拖拽被打断)。
+        """
+        self._mouse_stuck_ticks = 0
+        self._mouse_guard = QTimer(self)
+        self._mouse_guard.setInterval(800)
+        self._mouse_guard.timeout.connect(self._check_mouse_stuck)
+        self._mouse_guard.start()
+
+    def _check_mouse_stuck(self) -> None:
+        """捕获泄漏的自动解开。
+
+        判据刻意用**系统层**的 GetCapture(),而不是 Qt 的 mouseButtons():
+        Qt 的状态可能已经自己清干净了,而 SetCapture 还挂在系统里 ——
+        那种情况下 Qt 看着一切正常,用户却点哪都没反应。
+
+        唯一会误伤的场合是"用户真的按着鼠标在拖拽",那时捕获是正常的,
+        所以先用 GetAsyncKeyState 问一下物理按键。
+        """
+        from ..core.win32 import (GetCapture_, ReleaseCapture,
+                                  any_mouse_button_physically_down)
+        from ..log import write
+
+        if not GetCapture_():
+            self._mouse_stuck_ticks = 0
+            return
+        if any_mouse_button_physically_down():
+            # 真按着 —— 正常拖拽,别动,否则会把用户正在拖的东西放掉
+            self._mouse_stuck_ticks = 0
+            return
+        self._mouse_stuck_ticks += 1
+        if self._mouse_stuck_ticks < 2:      # 连着两拍(≈1.6 秒)才算泄漏
+            return
+        self._mouse_stuck_ticks = 0
+        ReleaseCapture()
+        write("检测到鼠标捕获泄漏(没有按键按下,系统却还抓着鼠标),已强制释放")
+
     # ---------------------------------------------------------------- 数据
     def refresh(self) -> None:
         our_pid = win32.get_window_pid(int(self.winId()))
