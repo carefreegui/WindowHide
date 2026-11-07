@@ -35,7 +35,11 @@ class MainWindow(QMainWindow):
         self._hotkeys = hotkeys
         self._tray = tray
         self._windows: list[WindowInfo] = []
-
+        # 自己是不是管理员 —— 决定"能不能碰那些以管理员权限运行的程序"。
+        # UIPI 会让普通权限进程对高权限窗口的所有操作直接失败(err=5),
+        # 而用户根本看不出来,只会觉得"这软件不支持我这个游戏"。
+        self._is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        self._high_pids: set[int] = set()   # 权限比我们高的进程(缓存)
         self.setWindowTitle("窗口隐藏工具")
         self.resize(980, 620)
         self._build_ui()
@@ -56,6 +60,35 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(central)
         v.setContentsMargins(12, 10, 12, 10)
         v.setSpacing(8)
+
+        # ---- 权限横幅 ----
+        # 以前这条信息只走"状态栏 + 托盘气泡",而气泡是可以在设置里关掉的
+        # (show_balloon),状态栏那行字又只闪几秒。于是用户点了隐藏、什么
+        # 都没发生、也没有任何持久提示 —— 只能猜"是不是这软件不支持游戏"。
+        # 现在做成列表上方的一条常驻横幅,**只在列表里真的出现高权限程序
+        # 时才出现**,不是天天挂着当噪音。
+        self._admin_banner = QWidget()
+        self._admin_banner.setStyleSheet(
+            "QWidget{background:#FFF4CE;border:1px solid #E3C05A;"
+            "border-radius:4px;}")
+        hb = QHBoxLayout(self._admin_banner)
+        hb.setContentsMargins(10, 6, 8, 6)
+        hb.setSpacing(8)
+        self._admin_hint = QLabel()
+        self._admin_hint.setWordWrap(True)
+        self._admin_hint.setStyleSheet(
+            "color:#5A4300;background:transparent;border:none;")
+        hb.addWidget(self._admin_hint, 1)
+        self._admin_btn = QPushButton("以管理员身份重启")
+        self._admin_btn.setCursor(Qt.PointingHandCursor)
+        self._admin_btn.setStyleSheet(
+            "QPushButton{background:#F2C64D;color:#3A2A00;"
+            "border:1px solid #C89B2E;padding:3px 10px;border-radius:3px;}"
+            "QPushButton:hover{background:#FFD666;}")
+        self._admin_btn.clicked.connect(self._restart_as_admin)
+        hb.addWidget(self._admin_btn)
+        self._admin_banner.setVisible(False)
+        v.addWidget(self._admin_banner)
 
         # ---- 顶部工具行 ----
         top = QHBoxLayout()
@@ -208,6 +241,10 @@ class MainWindow(QMainWindow):
         # 可见窗口 + 被本工具隐藏的窗口(后者要在列表里显示"已隐藏")
         self._windows = [w for w in windows
                          if w.pid != our_pid
+                         # 多开时另一个实例的窗口也别列出来(按 pid 排除
+                         # 只能挡住自己),否则用户会在列表里看到"窗口隐藏工具"
+                         # 自己,还能把自己藏了
+                         and (w.process_name or "").lower() != "windowhide.exe"
                          and (w.visible or w.hwnd in alive)
                          # 桌面/任务栏(explorer 的 Progman/Shell_TrayWnd)
                          # 一律不列 —— 它们混进来就等于给了用户一个
@@ -234,6 +271,7 @@ class MainWindow(QMainWindow):
         self._protected = protect.protected_set(self._config.protected_processes)
         self._apply_filter()
         self._update_status()
+        self._update_admin_banner()
 
     def _filtered_windows(self) -> list[WindowInfo]:
         text = self._search.text().strip().lower()
@@ -268,6 +306,51 @@ class MainWindow(QMainWindow):
                             getattr(self, "_protected", set()),
                             keep_audio=set(self._config.keep_audio_processes),
                             mute_reasons=self._mute_reasons())
+
+    # Windows 自己的高权限组件 —— 它们也会让横幅亮起来,但用户看到
+    # "「TabTip.exe」无法隐藏"只会一脸问号,所以排到后面去。
+    _WIN_COMPONENTS = (
+        "tabtip", "systemsettings", "applicationframehost", "textinputhost",
+        "shellexperiencehost", "searchhost", "startmenuexperiencehost",
+        "lockapp", "widgetservice", "securityhealth",
+    )
+
+    def _update_admin_banner(self) -> None:
+        """列表里出现"权限比我们高"的程序时,把横幅显示出来。
+
+        为什么做成"按需出现"而不是启动就常驻:大部分人用不到管理员程序,
+        一条黄色横幅天天挂着只会变成噪音,用户会习惯性无视它。但只要
+        这类窗口真的出现在列表里,就必须说清楚 —— 否则用户点隐藏只会
+        得到一次静默失败,然后怀疑"是不是这软件不支持我这游戏"。
+        """
+        if self._is_admin:
+            self._admin_banner.setVisible(False)
+            return
+
+        apps: list[str] = []       # 普通程序(用户真正想藏的)
+        comps: list[str] = []      # Windows 自带组件
+        for w in self._windows:
+            if w.pid not in self._high_pids:
+                if not win32.process_is_higher_integrity(w.pid):
+                    continue
+                self._high_pids.add(w.pid)
+            name = w.process_name or f"PID {w.pid}"
+            bucket = comps if name.lower().startswith(self._WIN_COMPONENTS) else apps
+            if name not in bucket:
+                bucket.append(name)
+
+        if not apps and not comps:
+            self._admin_banner.setVisible(False)
+            return
+
+        shown = (apps or comps)[:3]
+        total = len(apps) + len(comps)
+        more = f" 等 {total} 个程序" if total > len(shown) else ""
+        names = "、".join(f"「{n}」" for n in shown)
+        self._admin_hint.setText(
+            f"{names}{more} 以管理员权限运行,当前工具是普通权限 —— "
+            f"Windows 不允许操作它们的窗口,点隐藏会没有反应。")
+        self._admin_banner.setVisible(True)
 
     def _update_status(self) -> None:
         n_proc, n_win = self._controller.hidden_summary()
@@ -719,6 +802,12 @@ class MainWindow(QMainWindow):
         """目标权限比我们高:说清原因,别让用户以为工具坏了。"""
         self.statusBar().showMessage("警告:" + msg)
         self._tray.showMessage("需要管理员权限", msg)
+        # 横幅也一并亮起来:托盘气泡是用户可以关掉的(show_balloon),
+        # 而"这个程序我碰不到"是必须留下痕迹的信息 —— 否则用户点几次
+        # 隐藏都是静默失败,只会怀疑软件不支持。
+        if not self._is_admin:
+            self._admin_hint.setText(msg)
+            self._admin_banner.setVisible(True)
         from ..log import write
         write("界面提示: " + msg)
 
