@@ -102,6 +102,9 @@ class HiddenProcess:
     records: dict[int, WindowRecord] = field(default_factory=dict)
     muted: bool = False
     failed: int = 0  # 权限不足等原因未能隐藏的窗口数
+    # 其中"因为它是全屏、抢回窗口位置"而失败的个数。和普通的"藏不掉"
+    # 分开计,因为处置方式不一样:这种情况要告诉用户切成无边框窗口。
+    fs_failed: int = 0
     hung: bool = False  # 目标已无响应,整个进程都没碰
     profile: str = ""   # 由哪个场景藏的("" = 手动勾选)
     partial: bool = False  # 只藏了这个进程的一部分窗口(同程序多开)
@@ -135,6 +138,10 @@ class HideController(QObject):
         self._busy_lock = threading.Lock()
         self._busy = False                 # 有任务在跑,别叠加
         self._job_seq = 0                  # 任务代号(看门狗判"这条还是不是当前任务")
+        # 软隐藏看门狗:软隐藏的窗口随时可能被目标自己挪回屏幕里
+        # (全屏游戏每帧重排就会这么干),得有人盯着把它推回去。
+        self._keeper: threading.Thread | None = None
+        self._keeper_lock = threading.Lock()
         self._queued: tuple | None = None  # 忙时排队的最后一次请求
         # 用户手动恢复过的进程:自动应用规则时不要马上又把它藏回去
         # ("点恢复 → 3 秒后又没了"是我最讨厌的那种 bug)
@@ -409,6 +416,64 @@ class HideController(QObject):
             threading.Timer(BUSY_TIMEOUT, self._watchdog,
                             args=(job_id,)).start()
 
+    # ---------------------------------------------------- 软隐藏看门狗
+    # 软隐藏 = 把窗口挪到屏幕外。麻烦在于"挪走"这件事**目标程序可以反悔**:
+    # 全屏游戏在失去焦点、收到 WM_ACTIVATE、或者干脆每帧重排时,会把自己的
+    # 窗口重新设成铺满屏幕 —— 于是藏了 0.3 秒又回到眼前,用户看到的就是
+    # "全屏模式藏不住"。
+    #
+    # 解法很土但有效:有人盯着,发现它弹回屏幕里就再推出去一次。这个循环
+    # **只用异步 SetWindowPos**(投递,不等目标),所以目标卡死也冻不住它,
+    # 而且每 0.25 秒才跑一次,开销可以忽略。
+    KEEPER_INTERVAL = 0.25
+    KEEPER_IDLE_EXIT = 6.0     # 连续这么久没有软隐藏窗口就退出,别占着线程
+
+    def _ensure_keeper(self) -> None:
+        with self._keeper_lock:
+            if self._keeper is not None and self._keeper.is_alive():
+                return
+            self._keeper = threading.Thread(target=self._keeper_loop,
+                                            name="soft-keeper", daemon=True)
+            self._keeper.start()
+
+    def _keeper_loop(self) -> None:
+        from ..log import write
+        idle = 0.0
+        pushed = 0
+        while True:
+            with self._lock:
+                soft = [(hwnd, rec) for hp in self._hidden.values()
+                        for hwnd, rec in hp.records.items() if rec.soft]
+                # 正在被恢复的窗口不要推 —— 否则会和恢复动作打架:
+                # 恢复刚把它挪回屏幕内,看门狗立刻又推出屏幕外,用户看到
+                # 窗口"闪一下就没了",还以为没恢复。
+                soft = [(h, r) for h, r in soft
+                        if self._pending_hwnd.get(h) != "restore"]
+            if not soft:
+                time.sleep(self.KEEPER_INTERVAL)
+                idle += self.KEEPER_INTERVAL
+                if idle >= self.KEEPER_IDLE_EXIT:
+                    if pushed:
+                        write(f"软隐藏看门狗退出(期间把窗口推回屏幕外 {pushed} 次)")
+                    return
+                continue
+            idle = 0.0
+            for hwnd, _rec in soft:
+                try:
+                    if not win32.IsWindow(hwnd):
+                        continue
+                    if win32.is_moved_away(hwnd):
+                        continue
+                    # 弹回屏幕里了 —— 再推出去。异步,不会阻塞。
+                    win32.push_offscreen(hwnd)
+                    pushed += 1
+                    if pushed <= 3 or pushed % 40 == 0:
+                        write(f"软隐藏的窗口自己跑回屏幕里了(hwnd={hwnd:#x}),"
+                              f"已再次挪走(累计 {pushed} 次)")
+                except Exception:       # noqa: BLE001 - 看门狗绝不能被异常打死
+                    pass
+            time.sleep(self.KEEPER_INTERVAL)
+
     def _watchdog(self, job_id: int) -> None:
         """任务超时未返回 → 强制把队列让给下一个。
 
@@ -479,6 +544,7 @@ class HideController(QObject):
         """`only` 给定时只藏其中列出的窗口(手动勾选),否则藏整个进程。"""
         done = 0
         failed = 0
+        fs_failed = 0
         failed_names: list[str] = []
         blocked_names: list[str] = []
         hung_names: list[str] = []
@@ -530,6 +596,13 @@ class HideController(QObject):
                 hung_names.append(hp.process_name or name)
                 if hp.window_count == 0:
                     continue
+            # 一个窗口都没藏成:这条以前被完全吞掉(只判断 window_count>0),
+            # 于是"全屏游戏点了隐藏毫无反应、日志里什么都没写"。
+            if hp is not None and hp.window_count == 0 and hp.failed:
+                failed += hp.failed
+                fs_failed += hp.fs_failed
+                failed_names.append(hp.process_name or name)
+                continue
             if hp and hp.window_count > 0:
                 with self._lock:
                     cur = self._hidden.get(pid)
@@ -549,6 +622,7 @@ class HideController(QObject):
                 done += 1
                 if hp.failed:
                     failed += hp.failed
+                    fs_failed += hp.fs_failed
                     failed_names.append(hp.process_name or name)
         if done:
             self._save_state()
@@ -586,9 +660,19 @@ class HideController(QObject):
         if failed:
             # 静默失败最坑:用户以为藏好了,其实窗口还在屏幕上。
             names = "、".join(dict.fromkeys(failed_names))
-            self.hide_incomplete.emit(
-                failed, f"{names} 有 {failed} 个窗口没藏掉(已还原到原样),"
-                        "通常是它以独占全屏渲染,不接受隐藏指令。")
+            if fs_failed:
+                # 全屏窗口失败的原因几乎只有一个:它把窗口位置抢回去了。
+                # 这不是"软件不支持",而是必须换一种显示模式才能藏。
+                self.hide_incomplete.emit(
+                    failed,
+                    f"{names} 是全屏模式,游戏每帧都会把窗口重新铺满屏幕,"
+                    "藏不住(已还原,没有留下半藏状态)。\n"
+                    "解决办法:在游戏里把显示模式改成「无边框窗口化」"
+                    "(不是窗口化也行,无边框最接近全屏),再按一次隐藏就正常了。")
+            else:
+                self.hide_incomplete.emit(
+                    failed, f"{names} 有 {failed} 个窗口没藏掉(已还原到原样),"
+                            "通常是它以独占全屏渲染,不接受隐藏指令。")
         return done
 
     def hide_hwnds(self, hwnds: list[int], wait: bool = False,
@@ -691,6 +775,8 @@ class HideController(QObject):
         name = ""
         records: dict[int, WindowRecord] = {}
         failed = 0
+        fullscreen_failed = 0     # 其中因为"全屏抢回位置"失败的,提示词不一样
+        soft_seen = False         # 有没有藏成功软隐藏窗口(要开看门狗)
         hung = False
         # 先把候选和目标分清楚,再决定用哪条隐藏策略 ——
         # "先最小化再隐藏"是整进程级的动作(永劫无间最小化后引擎主线程
@@ -710,29 +796,39 @@ class HideController(QObject):
         screen_px = win32.screen_area()
         for w in targets:
             name = name or w.process_name
-            if win32.is_hung(w.hwnd):
-                # 未响应的窗口一个都别碰:任何同步窗口调用都会连带把
-                # 本工具卡死(实测"界面未响应,只能强杀进程")。
+            fullscreen = win32.is_fullscreen_window(w.hwnd)
+            soft_wanted = (getattr(self._settings, "soft_hide_games", True)
+                           and should_hide_soft(w, screen_px))
+            if not soft_wanted and win32.is_hung(w.hwnd):
+                # 硬隐藏(ShowWindow / SetWindowLongPtr)对未响应窗口会永久
+                # 阻塞,一个都不碰(实测"界面未响应,只能强杀进程")。
+                #
+                # 但软隐藏只投递异步 SetWindowPos + 一次带超时的改样式,
+                # 对"暂时不处理消息"的窗口是安全的 —— 而全屏游戏恰恰经常
+                # 被 IsHungAppWindow 判成未响应(引擎在渲染循环里忙)。所以
+                # 这类窗口先走软隐藏试试,别直接放弃。
                 hung = True
                 continue
-            fullscreen = win32.is_fullscreen_window(w.hwnd)
 
             # ---- 软隐藏:游戏/大窗口只"挪出屏幕",绝不动 WS_VISIBLE ----
             # 见 should_hide_soft 的注释:这类引擎收到"窗口不可见"就会
             # 把渲染和消息泵一起停掉,之后再也救不回来。
-            if (getattr(self._settings, "soft_hide_games", True)
-                    and should_hide_soft(w, screen_px)):
+            if soft_wanted:
                 show_cmd = win32.get_window_placement_cmd(w.hwnd)
-                ex_style, rect = win32.hide_soft(w.hwnd)
-                if not win32.wait_moved_away(w.hwnd, 0.6):
-                    # 没挪走(比如游戏自己把窗口移回来了):如实算失败,
-                    # 不留假记录,也不硬藏 —— 硬藏它就没法恢复了。
+                ex_style, rect, moved = win32.hide_soft(w.hwnd)
+                if not moved:
+                    # 没挪走/被抢回去:如实算失败,不留假记录,也不硬藏 ——
+                    # 硬藏它就没法恢复了。全屏窗口最常见的失败就是这一条:
+                    # 它每帧把窗口位置改回铺满屏幕,挪走一秒就被拉回来。
                     win32.restore_soft(w.hwnd, ex_style, rect)
                     failed += 1
+                    if fullscreen:
+                        fullscreen_failed += 1
                     continue
                 records[w.hwnd] = WindowRecord(
                     w.hwnd, ex_style, show_cmd, w.title, fullscreen,
                     soft=True, rect=rect)
+                soft_seen = True
                 continue
 
             ex_style, show_cmd = win32.hide_window(w.hwnd,
@@ -752,17 +848,36 @@ class HideController(QObject):
             records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title,
                                            fullscreen)
         if not records:
-            return HiddenProcess(pid=pid, process_name=name, hung=hung,
-                                 partial=partial) \
-                if hung else None
+            # 一个都没藏成。以前这里直接 `return None`,调用方看到 None 就
+            # 什么都不做 —— 于是"点了隐藏没反应、日志里也一个字都没有",
+            # 用户只能猜。现在把失败数带出去,让它能说清原因。
+            if not name:
+                name = win32.process_image_path(pid).rsplit("\\", 1)[-1]
+            if hung or failed:
+                hp = HiddenProcess(pid=pid, process_name=name, hung=hung,
+                                   failed=failed, fs_failed=fullscreen_failed,
+                                   partial=partial)
+                if failed:
+                    from ..log import write
+                    write(f"完全没能隐藏:{name}(pid={pid}) "
+                          f"{failed} 个窗口全部失败"
+                          + ("(全屏窗口把位置抢了回去)" if fullscreen_failed
+                             else ""))
+                return hp
+            return None
         if not name:
             # 调用方(如测试/命令行)不一定填过 process_name,报警文案要能
             # 指名道姓,不然用户只看到一个 pid
             name = win32.process_image_path(pid).rsplit("\\", 1)[-1]
 
         hp = HiddenProcess(pid=pid, process_name=name, records=records,
-                           failed=failed, hung=hung, profile=profile,
+                           failed=failed, fs_failed=fullscreen_failed,
+                           hung=hung, profile=profile,
                            partial=partial)
+        if soft_seen:
+            # 软隐藏的窗口随时可能被目标自己挪回屏幕里(全屏游戏每帧重排
+            # 就会这么干)。开一个看门狗,发现它弹回来就再推出去一次。
+            self._ensure_keeper()
         if failed:
             from ..log import write
             write(f"未能隐藏的窗口:{name}(pid={pid}) 失败 {failed}/{len(records)} 个")
@@ -1294,7 +1409,9 @@ class HideController(QObject):
             if rec_now is not None and rec_now.soft:
                 # 软隐藏的窗口"弹回来"= 被挪回屏幕内了,再挪出去就行。
                 # 别走 hide_window:那会真的 SW_HIDE,把引擎停掉。
-                win32.hide_soft(hwnd)
+                # 这里只推位置,不重新加样式(样式加一次就够,反复加会让
+                # 目标不停收到 WM_STYLECHANGING)。
+                win32.push_offscreen(hwnd, sync=True)
                 win32.wait_moved_away(hwnd, 0.4)
                 continue
             fullscreen = win32.is_fullscreen_window(hwnd)

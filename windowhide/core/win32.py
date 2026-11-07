@@ -1035,9 +1035,92 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
 
 
 SOFT_HIDE_POS = -32000      # 软隐藏时把窗口挪到这里(远在虚拟桌面之外)
+GA_ROOT = 2                 # GetAncestor:取最顶层祖先(判断"这点上是谁")
 
 
-def hide_soft(hwnd: int) -> tuple[int, tuple[int, int, int, int]]:
+def covers_screen_center(hwnd: int) -> bool:
+    """这个窗口现在还占着**屏幕上的要害位置**吗?(= 用户其实还看得见它)
+
+    为什么要这一条:"把窗口挪出屏幕"改的是窗口对象里的坐标,但真·独占全屏
+    的程序是由显卡直接输出画面、根本不理窗口坐标 —— 矩形改了,屏幕上的画面
+    纹丝不动。只看矩形会得到一个漂亮的假成功:记录写了、界面显示"已隐藏",
+    用户眼前还是游戏。
+
+    `WindowFromPoint` 直接问系统"这个像素点上是谁",绕不过去,而且很便宜。
+
+    采 5 个点而不是只取正中:本工具自己的窗口经常就盖在屏幕中央,只看中心
+    会把"游戏还铺满屏幕"误判成"已经藏好了"。只要有任何一点还属于目标窗口,
+    就说明它没真的让开。
+    """
+    if not IsWindow(hwnd):
+        return False
+    sw = user32.GetSystemMetrics(0)
+    sh = user32.GetSystemMetrics(1)
+    target_root = user32.GetAncestor(hwnd, GA_ROOT)
+    target_root = int(target_root) if target_root else int(hwnd)
+
+    for fx, fy in ((0.5, 0.5), (0.25, 0.25), (0.75, 0.25),
+                   (0.25, 0.75), (0.75, 0.75)):
+        pt = wintypes.POINT(int(sw * fx), int(sh * fy))
+        hit = user32.WindowFromPoint(pt)
+        if not hit:
+            continue
+        hit = int(hit)
+        if hit == int(hwnd):
+            return True
+        root = user32.GetAncestor(hit, GA_ROOT)
+        root = int(root) if root else hit
+        if root == target_root:
+            return True
+    return False
+
+
+def push_offscreen(hwnd: int, sync: bool = False) -> bool:
+    """把窗口挪到屏幕外。**只动位置,不碰任何可见性/样式**。
+
+    这是软隐藏的主力动作,也是"看门狗"反复补刀用的那一下。它一定要
+    便宜、一定要能反复调用:某些引擎(实测全屏游戏)在失去焦点、收到
+    `WM_ACTIVATE`、或者每帧重排时,会**把自己的窗口位置重新设回全屏**,
+    一次挪走根本不够,得有人盯着。
+
+    `sync=False` 走 `SWP_ASYNCWINDOWPOS`,只投递不等目标处理 —— 目标
+    卡住也不会把调用线程拖死(这条链上任何一个同步调用都能冻住整个队列,
+    血泪见 restore_window 的注释)。
+    """
+    flags = (SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+    if not sync:
+        flags |= SWP_ASYNCWINDOWPOS
+    return bool(SetWindowPos(hwnd, None, SOFT_HIDE_POS, SOFT_HIDE_POS,
+                             0, 0, flags))
+
+
+def settle_offscreen(hwnd: int, timeout: float = 0.55,
+                     hold: float = 0.3) -> bool:
+    """等窗口"稳定地待在屏幕外":先等它挪过去,再等 `hold` 秒确认没弹回来。
+
+    只判断"挪过去了"是不够的 —— 全屏游戏把位置抢回去往往就在几十毫秒内,
+    只看一眼会得到一个假的成功:记录写了、界面显示"已隐藏",而屏幕上
+    游戏还在。所以必须**再观察一小会儿**。
+    """
+    if not wait_moved_away(hwnd, timeout):
+        return False
+    time.sleep(hold)
+    return is_moved_away(hwnd)
+
+
+def soft_hidden_ok(hwnd: int, timeout: float = 0.55,
+                   hold: float = 0.3) -> bool:
+    """软隐藏成功的判据:**挪出屏幕 + 屏幕上真的看不到它了**。
+
+    两条缺一不可。只看坐标会骗人:真·独占全屏的程序由显卡直接输出画面,
+    窗口坐标改了、屏幕上的画面纹丝不动 —— 那样记一个"已隐藏"就是骗用户。
+    """
+    if not settle_offscreen(hwnd, timeout, hold):
+        return False
+    return not covers_screen_center(hwnd)
+
+
+def hide_soft(hwnd: int) -> tuple[int, tuple[int, int, int, int], bool]:
     """软隐藏:把窗口挪到屏幕外 + 退出任务栏,**绝不碰 WS_VISIBLE**。
 
     为什么需要它:Unity / Unreal 引擎一旦收到"窗口不可见",会**整个停掉
@@ -1049,15 +1132,40 @@ def hide_soft(hwnd: int) -> tuple[int, tuple[int, int, int, int]]:
     软隐藏让窗口对引擎来说**始终是"显示中"**:渲染照常跑,交换链不中断,
     恢复只是把它挪回原位。代价是它还在用 GPU(本来也没打算省)。
 
-    返回 (原扩展样式, 原矩形),供恢复用。
+    全屏窗口的额外麻烦:它会自己把位置抢回去。所以这里分三步 ——
+    先异步挪;稳定不了再同步挪;还不行就**连续补刀几次**,看有没有哪一次
+    能站住。真正的长期看门狗在 HideController 里(它会一直盯着)。
+
+    返回 (原扩展样式, 原矩形, 是否真的挪走并稳定住了)。
     """
     ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
     rect = get_window_rect(hwnd)
     set_ex_style(hwnd, add=WS_EX_TOOLWINDOW)
-    SetWindowPos(hwnd, None, SOFT_HIDE_POS, SOFT_HIDE_POS, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
-                 | SWP_ASYNCWINDOWPOS)
-    return ex, rect
+
+    # ① 异步挪:正常窗口这一步就结束了
+    push_offscreen(hwnd)
+    if soft_hidden_ok(hwnd, 0.55, 0.3):
+        return ex, rect, True
+
+    # ② 同步挪:对付"收到消息就把位置改回去"的窗口。目标是活的,
+    #    不会有永久阻塞的风险;万一它真卡住,外面还有任务看门狗兜着。
+    if IsWindow(hwnd):
+        push_offscreen(hwnd, sync=True)
+    if soft_hidden_ok(hwnd, 0.4, 0.25):
+        return ex, rect, True
+
+    # ③ 连推几次。有些引擎在"刚失去焦点"那一小段时间会连续重排窗口,
+    #    等它消停了就能压住。每次只看"这一下有没有站住"。
+    for _ in range(8):
+        if not IsWindow(hwnd):
+            break
+        push_offscreen(hwnd, sync=True)
+        time.sleep(0.12)
+        if is_moved_away(hwnd) and not covers_screen_center(hwnd):
+            time.sleep(0.18)
+            if is_moved_away(hwnd) and not covers_screen_center(hwnd):
+                return ex, rect, True
+    return ex, rect, False
 
 
 def is_moved_away(hwnd: int) -> bool:
