@@ -40,6 +40,13 @@ from .audio import set_process_mute
 from .targets import TargetRule
 from .trayhide import delete_process_tray_icons, request_tray_icon_restore
 
+# 一次隐藏/恢复最多允许占用多久。超过就强制把队列让给下一个请求。
+# 跨进程的窗口调用(`SetWindowLongPtr` / `SetWindowPlacement` /
+# `ShowWindow(SW_HIDE)`)对"暂时不处理消息"的目标会**永久阻塞** ——
+# 实测一个挂起窗口就能把恢复卡死,`_busy` 永不释放,之后所有操作都在
+# 排队,用户看到的是"程序像死了一样,点什么都无效"。
+BUSY_TIMEOUT = 10.0
+
 
 def _state_path() -> Path:
     base = os.environ.get("APPDATA")
@@ -95,6 +102,7 @@ class HideController(QObject):
         self._lock = threading.RLock()     # 保护 _hidden / _retry
         self._busy_lock = threading.Lock()
         self._busy = False                 # 有任务在跑,别叠加
+        self._job_seq = 0                  # 任务代号(看门狗判"这条还是不是当前任务")
         self._queued: tuple | None = None  # 忙时排队的最后一次请求
         # 用户手动恢复过的进程:自动应用规则时不要马上又把它藏回去
         # ("点恢复 → 3 秒后又没了"是我最讨厌的那种 bug)
@@ -319,10 +327,12 @@ class HideController(QObject):
                 write("上一个隐藏/恢复还没结束,本次请求已排队")
                 return True
             self._busy = True
-        self._start(fn, args)
+            self._job_seq += 1
+            job_id = self._job_seq
+        self._start(fn, args, job_id)
         return True
 
-    def _start(self, fn, args) -> None:
+    def _start(self, fn, args, job_id: int = 0) -> None:
         def run():
             try:
                 fn(*args)
@@ -331,15 +341,57 @@ class HideController(QObject):
                 write("后台隐藏/恢复出现异常:\n" + traceback.format_exc())
             finally:
                 with self._busy_lock:
+                    if self._job_seq != job_id and job_id:
+                        # 看门狗已经判定这个任务卡死、并把队列让给下一个了。
+                        # 我们只是那条卡住的线程后来终于醒了 —— 什么都不做,
+                        # 否则会把正在跑的新任务误标成"空闲"。
+                        return
                     self._busy = False
                     nxt = self._queued
                     self._queued = None
                 # 收尾刷新一次:即便中途失败,界面也该反映真实状态
                 self.state_changed.emit()
                 if nxt is not None:
-                    self._start(nxt[0], nxt[1])
+                    with self._busy_lock:
+                        self._busy = True
+                        self._job_seq += 1
+                        nid = self._job_seq
+                    self._start(nxt[0], nxt[1], nid)
 
         threading.Thread(target=run, name="hide-worker", daemon=True).start()
+        if job_id:
+            threading.Timer(BUSY_TIMEOUT, self._watchdog,
+                            args=(job_id,)).start()
+
+    def _watchdog(self, job_id: int) -> None:
+        """任务超时未返回 → 强制把队列让给下一个。
+
+        为什么需要这个:跨进程的窗口调用(`SetWindowLongPtr` /
+        `SetWindowPlacement` / `ShowWindow(SW_HIDE)`)对"暂时不处理消息"
+        的目标会**永久阻塞**,不是几秒,是不返回。实测一个挂起窗口就能
+        把恢复卡死,`_busy` 永不释放,之后用户按的每一次恢复/隐藏都只是
+        "排队后丢弃" —— 表现就是"程序像死了一样,点什么都无效"。
+
+        现在每个调用内部都有超时,这里是最后一道保险:无论卡在哪,
+        最多 BUSY_TIMEOUT 秒之后队列必须继续转。
+        """
+        with self._busy_lock:
+            if not self._busy or self._job_seq != job_id:
+                return
+            self._busy = False
+            self._job_seq += 1        # 让卡住那条线程回来时认不出来
+            nxt = self._queued
+            self._queued = None
+        from ..log import write
+        write(f"上一个隐藏/恢复超过 {BUSY_TIMEOUT:.0f} 秒仍未返回(卡在跨进程"
+              f"窗口调用上),已强制释放队列,后续操作可以继续")
+        self.state_changed.emit()
+        if nxt is not None:
+            with self._busy_lock:
+                self._busy = True
+                self._job_seq += 1
+                nid = self._job_seq
+            self._start(nxt[0], nxt[1], nid)
 
     def _wait_idle(self, timeout: float = 5.0) -> None:
         """等后台任务做完(同步调用前先用,避免和正在跑的隐藏/恢复打架)。"""

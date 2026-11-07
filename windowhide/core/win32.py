@@ -734,13 +734,66 @@ def enum_process_windows_all(pid: int) -> list[WindowInfo]:
 
 
 # ---------------------------------------------------------------- 全屏判定
-def set_ex_style(hwnd: int, add: int = 0, remove: int = 0) -> int:
-    """安全地增删窗口扩展样式,返回修改后的样式。"""
+_blocked_warned: dict[str, int] = {}
+_blocked_lock = threading.Lock()
+
+
+def _warn_blocked(what: str, hwnd: int) -> None:
+    """记录"某个同步窗口调用卡住了",同一种只记前几次(避免刷屏)。"""
+    with _blocked_lock:
+        n = _blocked_warned.get(what, 0) + 1
+        _blocked_warned[what] = n
+    if n > 5:
+        return
+    try:
+        from ..log import write
+        write(f"{what} 在 hwnd={hwnd:#x} 上超过预期时间没有返回"
+              f"(目标不处理窗口消息),已按失败处理、不再等它。第 {n} 次。")
+    except Exception:       # noqa: BLE001
+        pass
+
+
+def set_ex_style(hwnd: int, add: int = 0, remove: int = 0,
+                 timeout: float = 0.4) -> int:
+    """安全地增删窗口扩展样式,返回修改后的样式。
+
+    ⚠ 这个调用会给目标窗口发 `WM_STYLECHANGING` 并**等它处理完**。
+    实测(挂起窗口,6 秒超时都等不到):
+
+        set_ex_style(add TOOLWINDOW)      → 永远不返回
+        set_placement_cmd                → 永远不返回
+        ShowWindow(SW_HIDE)              → 永远不返回
+        ShowWindow(SW_SHOWNORMAL)        → 立即返回
+
+    所以**绝不能同步调用它**。它位于隐藏和恢复的第一步,一旦卡住,
+    整个"隐藏/恢复"任务就永远不结束,`_busy` 标志永不释放,用户之后
+    按的每一次恢复都只是"排队后丢弃" —— 表现为"点了完全没反应,
+    连托盘都不管用"。这就是用户踩到的"藏了回不来"的最终原因。
+
+    超时按"没改成"处理:调用返回旧样式,由调用方用 `get_window_styles()`
+    判断真实结果。宁可样式没摘掉,也不能把调用方拖死。
+    """
     old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
     new = (old | add) & ~remove
-    if new != old:
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new)
-    return new
+    if new == old:
+        return old
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            if IsWindow(hwnd):
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new)
+        except Exception:       # noqa: BLE001
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True,
+                     name=f"wh-style-{hwnd:x}").start()
+    if done.wait(timeout):
+        return GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    _warn_blocked("SetWindowLongPtr(GWL_EXSTYLE)", hwnd)
+    return old
 
 
 def monitor_rect(hwnd: int) -> tuple[int, int, int, int]:
@@ -807,19 +860,38 @@ def is_hung(hwnd: int) -> bool:
     return bool(IsHungAppWindow(hwnd))
 
 
-def set_placement_cmd(hwnd: int, show_cmd: int) -> bool:
+def set_placement_cmd(hwnd: int, show_cmd: int, timeout: float = 0.4) -> bool:
     """直接把窗口的显示状态改成 show_cmd(SetWindowPlacement)。
 
     比 `ShowWindow` 可靠的地方:不依赖目标程序处理 `WM_SHOWWINDOW`,
     是真正改窗口放置状态。对"被最小化的全屏游戏"这是唯一拉得回来的招
     (实测:永劫无间对 `ShowWindow(SW_SHOWNORMAL)` 完全没反应)。
+
+    ⚠ 但它是**同步**的:会给目标发消息并等回复。目标不 pump 消息时
+    永久阻塞(实测 6 秒都等不到),所以必须带超时 —— 超时按失败处理。
     """
     wp = WINDOWPLACEMENT()
     wp.length = ctypes.sizeof(WINDOWPLACEMENT)
     if not GetWindowPlacement(hwnd, ctypes.byref(wp)):
         return False
     wp.showCmd = show_cmd
-    return bool(SetWindowPlacement(hwnd, ctypes.byref(wp)))
+    box: dict[str, bool] = {"ok": False}
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            box["ok"] = bool(SetWindowPlacement(hwnd, ctypes.byref(wp)))
+        except Exception:       # noqa: BLE001
+            box["ok"] = False
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True,
+                     name=f"wh-place-{hwnd:x}").start()
+    if done.wait(timeout):
+        return box["ok"]
+    _warn_blocked("SetWindowPlacement", hwnd)
+    return False
 
 
 def force_foreground(hwnd: int) -> None:
@@ -978,10 +1050,46 @@ def _wait_visible(hwnd: int, timeout: float) -> bool:
         time.sleep(0.04)
 
 
+# 每个 hwnd 最多一个在途的 "同步 ShowWindow" 任务。
+_show_jobs: set[int] = set()
+_show_lock = threading.Lock()
+
+
+def _show_detached(hwnd: int, cmd: int) -> None:
+    """在独立线程里调同步 `ShowWindow`,不等它。
+
+    为什么必须单独开线程:`ShowWindow` 会给目标发 `WM_SHOWWINDOW` 并
+    **等它处理**,目标卡住时这里会一直阻塞到超时。但它又非调不可 ——
+    `ShowWindowAsync` 只是把请求投递进目标的消息队列,目标不 pump 消息
+    就永远不处理,窗口永远回不来(这就是"藏了回不来"的第二层原因)。
+
+    同步 `ShowWindow` 对 `WS_VISIBLE` 的修改是在 USER32 内部完成的,
+    不等目标;真正会阻塞的只是后面那句通知。所以把它丢到独立线程,
+    状态早就改好了,恢复流程也不用陪它一起等。
+    """
+    with _show_lock:
+        if hwnd in _show_jobs:
+            return          # 已经有一个在跑,别堆
+        _show_jobs.add(hwnd)
+
+    def run() -> None:
+        try:
+            if IsWindow(hwnd):
+                ShowWindow(hwnd, cmd)
+        except Exception:           # noqa: BLE001 - 后台线程,什么都不能抛
+            pass
+        finally:
+            with _show_lock:
+                _show_jobs.discard(hwnd)
+
+    threading.Thread(target=run, daemon=True,
+                     name=f"wh-show-{hwnd:x}").start()
+
+
 def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
     """恢复窗口:还原扩展样式,再按记录的命令显示。**返回是否确认已可见**。
 
-    两条铁律,都是"藏了回不来"之后补的:
+    三条铁律,都是"藏了回不来"之后补的:
 
     1. **样式无条件还原**。`SetWindowLongPtr(GWL_EXSTYLE)` 只是改窗口对象
        里的一个字段,由 USER32 自己改,不需要目标线程处理任何消息 —— 所以
@@ -993,7 +1101,13 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
     2. **必须校验真的回来了**。异步投递对"不 pump 消息的目标"完全无效,
        投完就当成功、记录一清,这个窗口就再也找不回来了(用户原话:
        "在工具里直接看不到它的进程了,任务管理器里还在跑")。
+
+    3. **同步 ShowWindow 放到独立线程**。它是唯一能叫醒"不 pump 消息"的
+       窗口的手段,但它会阻塞;放在恢复流程里就会让一次恢复卡 6~7 秒,
+       用户狂按按钮、全部排队(日志里全是"上一个动作还没结束,已排队")。
     """
+    from ..log import write
+
     cmd = show_cmd
     if cmd in (SW_HIDE, SW_SHOWMINNOACTIVE, SW_MINIMIZE):
         cmd = SW_SHOWNORMAL
@@ -1002,36 +1116,52 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
     elif cmd in (SW_SHOWNOACTIVATE, SW_SHOWNA):
         cmd = SW_SHOWNOACTIVATE
 
-    # ① 还样式 —— 无条件,不等任何人
+    already = IsWindowVisible(hwnd) and not IsIconic(hwnd)
+
+    # ① 还样式。**可能有超时**(见 set_ex_style 注释:对不处理消息的目标
+    #    SetWindowLongPtr 会永久阻塞),所以放在最前面并带超时 ——
+    #    即使没摘掉也不影响后面把窗口显示出来。
     set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
                  add=ex_style & WS_EX_TOOLWINDOW)
 
-    if IsWindowVisible(hwnd) and not IsIconic(hwnd):
-        return True
-
-    # ② 同步改放置状态。只在目标还处理消息时走:SetWindowPlacement 会等
-    #    目标处理 WM_WINDOWPOSCHANGING,目标是死的就把调用线程一起拖住。
-    if not is_hung(hwnd):
+    # ② 还放置状态(显示 + 最大化/最小化)。这一步要排在 ShowWindow 前面:
+    #    先显示成普通窗口再设最大化,窗口的 rcNormalPosition 会被当前大小
+    #    污染,恢复完尺寸差一条标题栏。
+    if not already:
         if set_placement_cmd(hwnd, cmd):
             _ensure_maximized(hwnd, cmd)
-            if _wait_visible(hwnd, 0.3):
-                return True
 
-    # ③ 异步投递:快,但目标不 pump 消息就等于没投
-    ShowWindowAsync(hwnd, cmd)
-    SetWindowPos(hwnd, None, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
-                 | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS)
-    if _wait_visible(hwnd, 0.6):
-        return True
-
-    # ④ 兜底:同步 ShowWindow。对未响应窗口它会阻塞几秒 —— 但调用方在
-    #    工作线程里,界面不会冻;而"藏了回不来"是用户绝对不能接受的结局。
-    #    ShowWindow 内部对 WS_VISIBLE 的修改在调用线程完成,只要目标不是
-    #    彻底死锁,窗口就能亮起来。
-    if IsWindow(hwnd):
+    # ③ 兜底显示:只用**不会阻塞**的调用。
+    #    ShowWindow(SW_SHOW*) 只置 WS_VISIBLE,不等目标回复
+    #    (会阻塞的是 SW_HIDE)。
+    if not IsWindowVisible(hwnd):
         ShowWindow(hwnd, cmd)
-    return _wait_visible(hwnd, 1.2)
+        if not _wait_visible(hwnd, 0.4):
+            ShowWindowAsync(hwnd, cmd)
+            SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                         | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                         | SWP_ASYNCWINDOWPOS)
+            if not _wait_visible(hwnd, 0.6):
+                _show_detached(hwnd, cmd)
+                _wait_visible(hwnd, 0.8)
+
+    if not IsWindow(hwnd):
+        return False
+    visible = bool(IsWindowVisible(hwnd))
+
+    # ④ 窗口可见之后再补一次样式。第 ① 步在"窗口还藏着、目标不处理消息"
+    #    的状态下很可能超时,而窗口一旦可见,目标更可能恢复处理消息,
+    #    这时摘样式才摘得掉。只有真的还带着 TOOLWINDOW 才多这一次。
+    ex_now = get_window_styles(hwnd)[1]
+    if visible and (ex_now & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_TOOLWINDOW):
+        set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW)
+        _ensure_maximized(hwnd, cmd)
+
+    if not visible:
+        write(f"恢复失败 hwnd={hwnd:#x}:窗口没能回到可见状态"
+              f"(存在={bool(IsWindow(hwnd))} iconic={bool(IsIconic(hwnd))})")
+    return visible
 
 
 def is_hidden(hwnd: int) -> bool:
