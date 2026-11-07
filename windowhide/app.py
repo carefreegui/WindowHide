@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from . import APP_DISPLAY_NAME
 from .config import Config
 from .core.hide import HideController
-from .core.hotkeys import HotkeyManager
+from .core.hotkeys import HotkeyManager, set_capture_hooks
 from .ui.icon import load_icon
 from .ui.main_window import SHOW_ME_MSG, MainWindow
 from .ui.tray import SystemTray
@@ -104,6 +104,10 @@ def main() -> int:
 
     controller = HideController(config)
     hotkeys = HotkeyManager()
+    # 录入新热键时临时注销全局热键、录完再注册回来。
+    # 不这么做的话,RegisterHotKey 会在系统层把按键截走:用户在设置里按一个
+    # 已经设过的组合,键进不了输入框,却真的把窗口藏了一次。
+    set_capture_hooks(hotkeys.pause, hotkeys.resume)
     tray = SystemTray()
     tray.show()
 

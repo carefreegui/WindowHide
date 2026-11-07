@@ -155,7 +155,7 @@ class MainWindow(QMainWindow):
         self._mouse_guard.start()
 
     def _check_mouse_stuck(self) -> None:
-        """捕获泄漏的自动解开。
+        """两个自愈:鼠标捕获泄漏 + 热键被暂停后没人恢复。
 
         判据刻意用**系统层**的 GetCapture(),而不是 Qt 的 mouseButtons():
         Qt 的状态可能已经自己清干净了,而 SetCapture 还挂在系统里 ——
@@ -164,10 +164,20 @@ class MainWindow(QMainWindow):
         唯一会误伤的场合是"用户真的按着鼠标在拖拽",那时捕获是正常的,
         所以先用 GetAsyncKeyState 问一下物理按键。
         """
+        from ..core.hotkeys import is_capturing
         from ..core.win32 import (GetCapture_, ReleaseCapture,
                                   any_mouse_button_physically_down)
         from ..log import write
 
+        # ---- 兜底层:热键因为"正在录入"被暂停,但录入早结束了 ----
+        # 正常路径由 begin/end_capture 配对恢复;这条只兜漏网(比如程序
+        # 在录入态被强杀后再启动、或者某次异常跳过了恢复)。没有它的话,
+        # 用户会看到"所有快捷键突然全部失效",比重启一次还难受。
+        if self._hotkeys.is_paused() and not is_capturing():
+            self._hotkeys.resume()
+            write("录入态已结束但热键仍在暂停,已自动恢复")
+
+        # ---- 主判断:鼠标捕获泄漏 ----
         if not GetCapture_():
             self._mouse_stuck_ticks = 0
             return

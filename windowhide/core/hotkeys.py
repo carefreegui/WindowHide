@@ -35,6 +35,14 @@ from .win32 import (
 )
 
 WM_APP = 0x8000
+# 发给热键消息窗口的内部指令:录入新热键时临时注销 / 事后恢复。
+# 为什么非要走消息:RegisterHotKey 注册的组合是**系统层截获**的 ——
+# 键盘驱动直接把它变成 WM_HOTKEY 投给注册窗口,焦点窗口连 WM_KEYDOWN
+# 都收不到。用户在录入框里按一个已经设过的组合,结果键进不了框,却把
+# 隐藏/恢复真的执行了一遍(还是拿着主界面勾选的那批窗口)。所以录入期间
+# 必须先注销,录完再注册回来。
+WM_APP_PAUSE = WM_APP + 1
+WM_APP_RESUME = WM_APP + 2
 MSG_STRING_SIZE = 256
 
 # 低级鼠标钩子出意外的次数。到了阈值就把回调变成"只转发"——见 mouse_proc
@@ -161,6 +169,31 @@ CAPTURE_MAX_SECONDS = 120.0           # 忘了退出就自动失效,不用重启
 
 _ANON_OWNER = 0                       # 没有 owner 的兼容调用(set_capturing)
 
+# 录入期间要临时注销全局热键,由 HotkeyManager 启动时登记这两个回调。
+# 放在模块级而不是让 hotkey_edit 直接持有 manager:界面层不该知道热键线程
+# 的存在,它只需要说"我进录入态了 / 我退了"。
+_pause_cb = None
+_resume_cb = None
+
+
+def set_capture_hooks(pause_cb, resume_cb) -> None:
+    """由 HotkeyManager 在启动时登记(见 app.py)。"""
+    global _pause_cb, _resume_cb
+    _pause_cb, _resume_cb = pause_cb, resume_cb
+
+
+def _notify_capture_state(capturing: bool) -> None:
+    """第一个 owner 进来 → 暂停热键;最后一个 owner 走掉 → 恢复。"""
+    cb = _pause_cb if capturing else _resume_cb
+    if cb is None:
+        return
+    try:
+        cb()
+    except Exception:
+        # 这里绝不能把异常抛给界面:暂停失败最多是"按键没录进去",
+        # 抛出去就是设置窗口打不开了。
+        pass
+
 
 def _capture_active() -> bool:
     """钩子回调里调用的版本:绝不拿锁、绝不阻塞。
@@ -179,28 +212,37 @@ def _capture_active() -> bool:
 
 
 def begin_capture(owner: int) -> None:
-    """登记"我在等按键"。owner 用 `id(按钮)`,每个按钮独立一条。"""
+    """登记"我在等按键"。第一个进来的人负责暂停全局热键。"""
     global _capture_deadline
     with _capture_lock:
+        first = not _capture_owners
         _capture_owners.add(owner)
         _capture_deadline = time.monotonic() + CAPTURE_MAX_SECONDS
         _capturing.set()
+    if first:
+        _notify_capture_state(True)
 
 
 def end_capture(owner: int) -> None:
-    """销自己那一条;还有别人在等就保持捕获态。"""
+    """销自己那一条;最后一个走掉的人负责把热键恢复回去。"""
     with _capture_lock:
         _capture_owners.discard(owner)
-        if not _capture_owners:
+        last = not _capture_owners
+        if last:
             _capturing.clear()
+    if last:
+        _notify_capture_state(False)
 
 
 def reset_capture() -> None:
     """无条件清空。设置对话框关闭时必须调这个 —— 那是唯一能保证
     "不管里面发生过多乱的事,出门时一定是干净的"的地方。"""
     with _capture_lock:
+        had = bool(_capture_owners)
         _capture_owners.clear()
         _capturing.clear()
+    if had:
+        _notify_capture_state(False)
 
 
 def set_capturing(on: bool) -> None:
@@ -353,6 +395,8 @@ class HotkeyManager(QObject):
         self._hwnd = 0
         self._hwnd_to_action: dict[int, str] = {}
         self._class_seq = 0
+        self._paused = False
+        self._pause_ack = threading.Event()
 
     # ------------------------------------------------------------ 公共接口
     def set_hotkeys(self, specs: dict[str, tuple[int, int]],
@@ -369,6 +413,8 @@ class HotkeyManager(QObject):
         with self._lock:
             self._specs = dict(specs)
             self._mouse = dict(mouse or {})
+            # 应用新配置 = 这些热键该生效,不管之前是不是因为录入被暂停过
+            self._paused = False
             self._stop_thread()
             if (any(vk for _, vk in specs.values())
                     or any(self._mouse.values())):
@@ -378,6 +424,54 @@ class HotkeyManager(QObject):
     def stop(self) -> None:
         with self._lock:
             self._stop_thread()
+
+    # ------------------------------------------------------------ 录入期暂停
+    def pause(self) -> None:
+        """临时注销所有全局键盘热键。侧键钩子**保留**(录入侧键还得靠它)。
+
+        🔴 为什么必须这么做:`RegisterHotKey` 注册的组合是**系统层截获**的 ——
+        键盘驱动直接把它变成 WM_HOTKEY 投给注册窗口,焦点窗口连 WM_KEYDOWN
+        都收不到。用户在录入框里按一个已经设过的组合时:
+          · 键进不了输入框 → 想改成"和另一个一样"根本录不进去;
+          · 却真的触发了一次隐藏 —— 用的还是主界面勾着的那批窗口。
+        用户的感受就是"我在设置里按键,窗口居然真被藏了"。
+
+        用户为此想出的"偏方"是"先别在主界面勾选任何东西",这说明问题已经
+        严重到影响正常使用了。
+        """
+        with self._lock:
+            if self._paused:
+                return
+            hwnd = self._hwnd
+            self._paused = True
+        if not hwnd:
+            return
+        self._pause_ack.clear()
+        user32.PostMessageW(wintypes.HWND(hwnd), WM_APP_PAUSE, 0, 0)
+        # 异步投递 + 短超时:热键线程收到后只做几次 UnregisterHotKey,微秒级。
+        # 0.2 秒是给"线程刚起、消息循环还没转起来"留的余量。绝不 SendMessage
+        # —— 那是跨线程同步调用,对方卡住会把界面一起冻死。
+        if not self._pause_ack.wait(0.2):
+            from ..log import write
+            write("热键暂停超时(线程未响应),录入时可能仍会误触发全局热键")
+
+    def resume(self) -> None:
+        """把 pause() 注销掉的热键重新注册回来。"""
+        with self._lock:
+            if not self._paused:
+                return
+            hwnd = self._hwnd
+            self._paused = False
+        if not hwnd:
+            return
+        self._pause_ack.clear()
+        user32.PostMessageW(wintypes.HWND(hwnd), WM_APP_RESUME, 0, 0)
+        self._pause_ack.wait(0.2)
+
+    def is_paused(self) -> bool:
+        """热键现在是不是因为"正在录入"被临时注销了。"""
+        with self._lock:
+            return self._paused
 
     def registered_actions(self) -> list[str]:
         """已成功注册的热键 action 列表(诊断用)。"""
@@ -409,6 +503,9 @@ class HotkeyManager(QObject):
 
         hinstance = GetModuleHandleW(None)
         local_map: dict[int, str] = {}   # 本线程的热键 id -> action(闭包捕获)
+        # 注册成功的 (hid, mods, vk)。暂停后要照这张表重新注册,
+        # 所以必须留着原始参数 —— local_map 只有 action 名。
+        reg_specs: list[tuple[int, int, int]] = []
 
         # 侧键单独一张表:它们不走 RegisterHotKey(那个接口不认识鼠标),
         # 由下面的低级钩子处理。两种来源都收:显式给的 mouse 参数,以及
@@ -436,6 +533,23 @@ class HotkeyManager(QObject):
                 action = local_map.get(int(wparam))
                 if action:
                     self.triggered.emit(action)
+                return 0
+            if umsg == WM_APP_PAUSE:
+                # 录入新热键:全部注销。侧键钩子**不动** —— 录入侧键还得靠它,
+                # 而钩子在捕获态下本来就走"放行 + 转发"分支,不会触发动作。
+                for hid, _mods, _vk in reg_specs:
+                    UnregisterHotKey(hwnd, hid)
+                self._pause_ack.set()
+                return 0
+            if umsg == WM_APP_RESUME:
+                refailed = []
+                for hid, mods, vk in reg_specs:
+                    if not RegisterHotKey(hwnd, hid, mods | MOD_NOREPEAT, vk):
+                        refailed.append(local_map.get(hid, str(hid)))
+                self._pause_ack.set()
+                if refailed:
+                    # 暂停期间被别人抢走的情况极少,但不能静默
+                    self.register_failed.emit(",".join(refailed))
                 return 0
             return DefWindowProcW(hwnd, umsg, wparam, lparam)
 
@@ -474,6 +588,7 @@ class HotkeyManager(QObject):
                 if RegisterHotKey(hwnd, hid, mods | MOD_NOREPEAT, vk):
                     local_map[hid] = action
                     registered[(mods, vk)] = action
+                    reg_specs.append((hid, mods, vk))
                     break
                 if attempt < 5:
                     time.sleep(0.1)
