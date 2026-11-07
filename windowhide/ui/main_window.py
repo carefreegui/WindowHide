@@ -215,7 +215,18 @@ class MainWindow(QMainWindow):
                          and not win32.is_shell_window(w.hwnd)
                          # 无标题但铺满屏幕的(全屏游戏常见)也要列出来,
                          # 否则用户根本没地方勾选它
-                         and (w.title or win32.is_fullscreen_window(w.hwnd))]
+                         #
+                         # 后两个条件是同一件事的两半:UE 游戏(异环/永劫)在
+                         # 被隐藏、甚至恢复之后,会把自己的窗口标题清空。
+                         # 如果只按"必须有标题"筛,它就会从列表里凭空消失 ——
+                         # 用户看到的是"藏完工具里就没这个进程了",或者
+                         # "它在屏幕上,但工具里找不到"。所以:
+                         # · 在隐藏记录里的,无条件列出
+                         # · 没有标题但体积够大的,也列出
+                         and (w.title or w.hwnd in alive
+                              or win32.is_fullscreen_window(w.hwnd)
+                              or (w.rect[2] - w.rect[0] >= 400
+                                  and w.rect[3] - w.rect[1] >= 300))]
         for w in self._windows:
             w.process_name = w.process_name or win32.process_image_path(w.pid).rsplit("\\", 1)[-1]
             if not w.process_path:
