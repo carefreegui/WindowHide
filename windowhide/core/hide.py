@@ -37,6 +37,7 @@ from ..config import MUTE_ALWAYS, MUTE_INHERIT, MUTE_NEVER
 from . import protect
 from . import win32
 from .audio import set_process_mute
+from .classify import classify_window
 from .targets import TargetRule
 from .trayhide import delete_process_tray_icons, request_tray_icon_restore
 
@@ -46,6 +47,32 @@ from .trayhide import delete_process_tray_icons, request_tray_icon_restore
 # 实测一个挂起窗口就能把恢复卡死,`_busy` 永不释放,之后所有操作都在
 # 排队,用户看到的是"程序像死了一样,点什么都无效"。
 BUSY_TIMEOUT = 10.0
+
+
+def should_hide_soft(win, screen_px: int) -> bool:
+    """这个窗口该用"挪出屏幕"(软隐藏)而不是"真正隐藏"吗?
+
+    实测教训(永劫无间,UnityWndClass):Unity/Unreal 引擎一旦收到
+    "窗口不可见",会**整个停掉渲染循环和消息泵**。进程还在、内存还占着
+    3GB,但 CPU 从几十% 掉到 0.3%;之后想恢复,`SetWindowLongPtr` /
+    `SetWindowPlacement` / `ShowWindow` 全部超时 —— 窗口再也回不来,
+    用户看到的是"游戏打不开了,任务管理器里还占着内存"。
+
+    软隐藏不碰 `WS_VISIBLE`,引擎始终认为窗口可见,渲染照常跑,
+    恢复只是"挪回去"。
+
+    判据(满足任一):
+    * 分类是「游戏」—— 这类引擎的暂停行为是通病
+    * 窗口面积超过屏幕的 35% —— 全屏/准全屏程序普遍有同样的毛病
+    """
+    try:
+        if classify_window(win) == "game":
+            return True
+    except Exception:           # noqa: BLE001 - 分类失败不该拦住隐藏
+        pass
+    r = win.rect
+    area = max(0, r[2] - r[0]) * max(0, r[3] - r[1])
+    return bool(screen_px) and area >= screen_px * 0.35
 
 
 def _state_path() -> Path:
@@ -61,6 +88,11 @@ class WindowRecord:
     show_cmd: int
     title: str = ""
     fullscreen: bool = False   # 隐藏时是否全屏(走的是"先最小化再隐藏")
+    # 软隐藏:不碰 WS_VISIBLE,只把窗口挪到屏幕外 + 退出任务栏。
+    # 给游戏用 —— 见 win32.hide_soft 的注释:Unity/UE 一旦收到"不可见"
+    # 就会整个停掉渲染和消息泵,之后再也救不回来。
+    soft: bool = False
+    rect: tuple[int, int, int, int] = (0, 0, 0, 0)   # 软隐藏前的矩形
 
 
 @dataclass(slots=True)
@@ -133,7 +165,8 @@ class HideController(QObject):
                  "profile": hp.profile, "partial": hp.partial,
                  "records": [{"hwnd": r.hwnd, "ex_style": r.ex_style,
                               "show_cmd": r.show_cmd, "title": r.title,
-                              "fullscreen": r.fullscreen}
+                              "fullscreen": r.fullscreen,
+                              "soft": r.soft, "rect": list(r.rect)}
                              for r in hp.records.values()]}
                 for hp in self._hidden.values()
             ]}
@@ -171,14 +204,27 @@ class HideController(QObject):
                     continue
                 if win32.get_window_pid(hwnd) != pid:
                     continue          # 句柄已被回收给别的窗口
-                if win32.IsWindowVisible(hwnd) and not win32.IsIconic(hwnd):
+                soft = bool(rec.get("soft", False))
+                if soft:
+                    # 软隐藏的窗口**仍然是可见的**(我们只把它挪走了),
+                    # 所以判据是"位置还在屏幕外",不能用可见性判断 ——
+                    # 用可见性判会把所有软隐藏的记录全丢掉。
+                    if not win32.is_moved_away(hwnd):
+                        continue
+                elif win32.IsWindowVisible(hwnd) and not win32.IsIconic(hwnd):
                     continue          # 已经重新显示了,不是我们隐藏的状态
                 if not (win32.get_window_styles(hwnd)[1] & win32.WS_EX_TOOLWINDOW):
                     continue          # 没有我们加的工具窗样式
+                raw_rect = rec.get("rect") or [0, 0, 0, 0]
+                try:
+                    rect = tuple(int(v) for v in raw_rect)[:4]
+                except (TypeError, ValueError):
+                    rect = (0, 0, 0, 0)
                 hp.records[hwnd] = WindowRecord(
                     hwnd, int(rec.get("ex_style", 0)),
                     int(rec.get("show_cmd", 9)), str(rec.get("title", "")),
-                    bool(rec.get("fullscreen", False)))
+                    bool(rec.get("fullscreen", False)), soft,
+                    rect if len(rect) == 4 else (0, 0, 0, 0))
             if hp.records:
                 self._hidden[pid] = hp
                 loaded += 1
@@ -661,6 +707,7 @@ class HideController(QObject):
                          if w.hwnd not in wanted and w.visible and not w.minimized)
         partial = others > 0
         allow_minimize = self._settings.force_fullscreen_hide and not partial
+        screen_px = win32.screen_area()
         for w in targets:
             name = name or w.process_name
             if win32.is_hung(w.hwnd):
@@ -669,6 +716,25 @@ class HideController(QObject):
                 hung = True
                 continue
             fullscreen = win32.is_fullscreen_window(w.hwnd)
+
+            # ---- 软隐藏:游戏/大窗口只"挪出屏幕",绝不动 WS_VISIBLE ----
+            # 见 should_hide_soft 的注释:这类引擎收到"窗口不可见"就会
+            # 把渲染和消息泵一起停掉,之后再也救不回来。
+            if (getattr(self._settings, "soft_hide_games", True)
+                    and should_hide_soft(w, screen_px)):
+                show_cmd = win32.get_window_placement_cmd(w.hwnd)
+                ex_style, rect = win32.hide_soft(w.hwnd)
+                if not win32.wait_moved_away(w.hwnd, 0.6):
+                    # 没挪走(比如游戏自己把窗口移回来了):如实算失败,
+                    # 不留假记录,也不硬藏 —— 硬藏它就没法恢复了。
+                    win32.restore_soft(w.hwnd, ex_style, rect)
+                    failed += 1
+                    continue
+                records[w.hwnd] = WindowRecord(
+                    w.hwnd, ex_style, show_cmd, w.title, fullscreen,
+                    soft=True, rect=rect)
+                continue
+
             ex_style, show_cmd = win32.hide_window(w.hwnd,
                                                    allow_minimize=allow_minimize)
             # 判据是"真的不在屏幕上了"(隐藏或最小化),不是 IsWindowVisible ——
@@ -817,7 +883,17 @@ class HideController(QObject):
                 # 这不算"恢复失败":没有可恢复的东西。
                 hp.records.pop(hwnd, None)
                 continue
-            if not win32.restore_window(hwnd, rec.ex_style, rec.show_cmd):
+            if rec.soft:
+                # 软隐藏:挪回原位。这条路**不依赖目标处理消息**,
+                # 所以哪怕引擎"半睡"也能立刻回来。
+                ok = win32.restore_soft(hwnd, rec.ex_style, rec.rect)
+                if ok and rec.show_cmd == win32.SW_SHOWMAXIMIZED:
+                    # 原来是最大化的,挪回来之后再还原一次状态
+                    if win32.set_placement_cmd(hwnd, rec.show_cmd):
+                        win32.ensure_maximized(hwnd, rec.show_cmd)
+            else:
+                ok = win32.restore_window(hwnd, rec.ex_style, rec.show_cmd)
+            if not ok:
                 failed.append(hwnd)
                 continue        # 🔴 记录留着:用户还能再点一次恢复
             hp.records.pop(hwnd, None)
@@ -1212,6 +1288,14 @@ class HideController(QObject):
                 hp = next((h for h in self._hidden.values()
                            if hwnd in h.records), None)
             if hp is None:
+                continue
+            with self._lock:
+                rec_now = hp.records.get(hwnd)
+            if rec_now is not None and rec_now.soft:
+                # 软隐藏的窗口"弹回来"= 被挪回屏幕内了,再挪出去就行。
+                # 别走 hide_window:那会真的 SW_HIDE,把引擎停掉。
+                win32.hide_soft(hwnd)
+                win32.wait_moved_away(hwnd, 0.4)
                 continue
             fullscreen = win32.is_fullscreen_window(hwnd)
             ex_style, show_cmd = win32.hide_window(

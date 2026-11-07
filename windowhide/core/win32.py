@@ -796,6 +796,16 @@ def set_ex_style(hwnd: int, add: int = 0, remove: int = 0,
     return old
 
 
+def screen_area() -> int:
+    """主屏幕的像素面积。用来判断"这个窗口是不是大得像游戏。"""
+    try:
+        w = user32.GetSystemMetrics(0)
+        h = user32.GetSystemMetrics(1)
+        return max(0, w) * max(0, h)
+    except Exception:       # noqa: BLE001
+        return 0
+
+
 def monitor_rect(hwnd: int) -> tuple[int, int, int, int]:
     """窗口所在显示器的物理矩形;失败返回全 0。"""
     hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
@@ -1024,6 +1034,75 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
     return ex_style, show_cmd
 
 
+SOFT_HIDE_POS = -32000      # 软隐藏时把窗口挪到这里(远在虚拟桌面之外)
+
+
+def hide_soft(hwnd: int) -> tuple[int, tuple[int, int, int, int]]:
+    """软隐藏:把窗口挪到屏幕外 + 退出任务栏,**绝不碰 WS_VISIBLE**。
+
+    为什么需要它:Unity / Unreal 引擎一旦收到"窗口不可见",会**整个停掉
+    渲染循环和消息泵**。实测(永劫无间,UnityWndClass):藏完之后进程还在、
+    内存还占着 3GB,但 CPU 从几十% 掉到 0.3%,之后 `SetWindowLongPtr` /
+    `SetWindowPlacement` / `ShowWindow` 全部超时 —— 窗口再也回不来,
+    用户看到的就是"游戏打不开,任务管理器里还占着内存"。
+
+    软隐藏让窗口对引擎来说**始终是"显示中"**:渲染照常跑,交换链不中断,
+    恢复只是把它挪回原位。代价是它还在用 GPU(本来也没打算省)。
+
+    返回 (原扩展样式, 原矩形),供恢复用。
+    """
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    rect = get_window_rect(hwnd)
+    set_ex_style(hwnd, add=WS_EX_TOOLWINDOW)
+    SetWindowPos(hwnd, None, SOFT_HIDE_POS, SOFT_HIDE_POS, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                 | SWP_ASYNCWINDOWPOS)
+    return ex, rect
+
+
+def is_moved_away(hwnd: int) -> bool:
+    """窗口是不是已经被挪到屏幕外了(软隐藏的判据)。"""
+    if not IsWindow(hwnd):
+        return False
+    r = get_window_rect(hwnd)
+    if r[2] <= 0 or r[3] <= 0:
+        return True
+    return r[0] <= SOFT_HIDE_POS + 1000 or r[1] <= SOFT_HIDE_POS + 1000
+
+
+def wait_moved_away(hwnd: int, timeout: float = 0.6) -> bool:
+    """等窗口真的被挪走(异步 SetWindowPos 投递后要等它落地)。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        if is_moved_away(hwnd):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.04)
+
+
+def restore_soft(hwnd: int, ex_style: int,
+                 rect: tuple[int, int, int, int]) -> bool:
+    """软隐藏的恢复:挪回原来的位置和大小 + 摘掉 TOOLWINDOW。
+
+    返回是否确认回到了屏幕内。
+    """
+    if not IsWindow(hwnd):
+        return False
+    x, y, right, bottom = rect
+    w, h = max(1, right - x), max(1, bottom - y)
+    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                 add=ex_style & WS_EX_TOOLWINDOW)
+    SetWindowPos(hwnd, None, x, y, w, h,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+    deadline = time.monotonic() + 1.2
+    while time.monotonic() < deadline:
+        if not is_moved_away(hwnd):
+            return True
+        time.sleep(0.04)
+    return not is_moved_away(hwnd)
+
+
 def undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
     """把没藏干净的操作撤回原样(去样式 + 拉回显示)。"""
     if not is_hung(hwnd):
@@ -1129,7 +1208,7 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
     #    污染,恢复完尺寸差一条标题栏。
     if not already:
         if set_placement_cmd(hwnd, cmd):
-            _ensure_maximized(hwnd, cmd)
+            ensure_maximized(hwnd, cmd)
 
     # ③ 兜底显示:只用**不会阻塞**的调用。
     #    ShowWindow(SW_SHOW*) 只置 WS_VISIBLE,不等目标回复
@@ -1156,7 +1235,7 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
     ex_now = get_window_styles(hwnd)[1]
     if visible and (ex_now & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_TOOLWINDOW):
         set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW)
-        _ensure_maximized(hwnd, cmd)
+        ensure_maximized(hwnd, cmd)
 
     if not visible:
         write(f"恢复失败 hwnd={hwnd:#x}:窗口没能回到可见状态"
@@ -1168,7 +1247,7 @@ def is_hidden(hwnd: int) -> bool:
     return not IsWindowVisible(hwnd)
 
 
-def _ensure_maximized(hwnd: int, cmd: int, timeout: float = 0.3) -> None:
+def ensure_maximized(hwnd: int, cmd: int, timeout: float = 0.3) -> None:
     """记录的是最大化,恢复后却没最大化 —— 补一刀。
 
     `SetWindowPlacement(SW_SHOWMAXIMIZED)` 偶尔不落地:目标程序会在

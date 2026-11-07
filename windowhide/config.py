@@ -204,6 +204,13 @@ class Config:
     # 游戏自己回不来、工具也跟着卡死。默认行为是"藏不掉就如实说",
     # 至少不会把用户的对局搞没。
     force_fullscreen_hide: bool = False
+    # 游戏「挪出屏幕」而不是真正隐藏。
+    # **默认开启** —— Unity/Unreal 引擎收到"窗口不可见"就会把渲染循环和
+    # 消息泵一起停掉:进程还在、内存还占着,但 CPU 掉到 0.3%,之后所有
+    # 窗口 API 全部超时,窗口再也救不回来(永劫无间实测)。
+    # 软隐藏不碰 WS_VISIBLE,只把窗口挪到屏幕外 + 退出任务栏,
+    # 引擎照常跑,恢复只是"挪回来"。代价是 GPU 仍在用。
+    soft_hide_games: bool = True
     # 规则持续生效:目标程序重启后自动按当前场景再藏一次。
     # 默认关闭 —— "打开就被藏"对没预期的人很吓人
     auto_apply_rules: bool = False
@@ -304,6 +311,7 @@ class Config:
             "show_minimize_hint": self.show_minimize_hint,
             "autostart": self.autostart,
             "force_fullscreen_hide": self.force_fullscreen_hide,
+            "soft_hide_games": self.soft_hide_games,
             "auto_apply_rules": self.auto_apply_rules,
             "profiles": [p.to_dict() for p in self.profiles],
             "active_profile": self.active_profile,
@@ -331,7 +339,8 @@ class Config:
             c.hotkey_hide_self = HotkeySpec.from_dict(d["hotkey_foreground"])
         for key in ("mute_on_hide", "keep_hidden", "activate_on_restore",
                     "minimize_to_tray", "show_balloon", "show_minimize_hint",
-                    "autostart", "force_fullscreen_hide", "auto_apply_rules"):
+                    "autostart", "force_fullscreen_hide", "soft_hide_games",
+                    "auto_apply_rules"):
             # 只认真正的布尔值:bool("yes") 会静默变成 True,把用户
             # 手改坏的配置读成"开",排查起来极其费劲
             if isinstance(d.get(key), bool):
