@@ -16,7 +16,7 @@ from ..config import Config
 from ..core import protect, win32
 from ..core.classify import TYPE_LABELS, classify_window
 from ..core.hide import HideController
-from ..core.hotkeys import HotkeyManager
+from ..core.hotkeys import HotkeyManager, plan_hotkeys
 from ..core.targets import TargetRule, resolve_target_hwnds
 from ..core.win32 import WindowInfo
 from .settings_dialog import SettingsDialog
@@ -320,7 +320,21 @@ class MainWindow(QMainWindow):
         self._controller.restore_all()
 
     def _toggle_targets(self) -> None:
-        self._controller.toggle(self._current_targets())
+        """切换:有目标就逐个切;一个目标都没有、但确实藏着东西 → 直接恢复。
+
+        后半句是给"隐藏键和恢复键设成同一个"准备的。藏完之后勾选/规则可能
+        已经对不上,`_current_targets()` 返回空,toggle 就退化成"没目标,
+        什么都不做" —— 用户体感正是"按第二下没反应,只能隐藏不能恢复"。
+        """
+        targets = self._current_targets()
+        if not targets:
+            if self._controller.hidden_hwnds():
+                self._controller.restore_all()
+            else:
+                self.statusBar().showMessage(
+                    "提示:没有勾选任何窗口,也没有命中场景规则", 5000)
+            return
+        self._controller.toggle(targets)
 
     def _toggle_hwnd(self, hwnd: int) -> None:
         # 用"已隐藏或正在隐藏"判断,别用纯状态:隐藏是异步的,双击的
@@ -469,36 +483,17 @@ class MainWindow(QMainWindow):
             self._config.apply_autostart()
 
     def _apply_hotkeys(self) -> None:
-        c = self._config
-        # 注册前最后一道闸:不安全的组合一律按"未设置"处理,宁可没热键,
-        # 也不能把全系统的输入抢走。config 加载时已经自愈过一次,这里防的是
-        # 内存里被别处改脏(以及"用户手工编辑 config.json"这条路)。
-        unsafe = []
-
-        def pair(spec):
-            if not spec.safe:
-                unsafe.append(spec)
-                return 0, 0
-            return spec.mods, spec.vk
-
-        # toggle 模式:一个键反复切换;split 模式:隐藏键 + 恢复键分开。
-        # 另有一个"隐藏本工具"(收进托盘),与模式无关,始终注册。
-        specs = {"hide_self": pair(c.hotkey_hide_self)}
-        mouse: dict[str, int] = {}
-        if c.hotkey_mode == "split":
-            specs["hide"] = pair(c.hotkey_hide)
-            specs["restore"] = pair(c.hotkey_restore)
-            mouse["hide"] = c.hotkey_hide_mouse.vk
-            mouse["restore"] = c.hotkey_restore_mouse.vk
-        else:
-            specs["toggle"] = pair(c.hotkey_toggle)
-            mouse["toggle"] = c.hotkey_toggle_mouse.vk
-        if unsafe:
-            from ..log import write
-            write(f"拒绝注册 {len(unsafe)} 个危险热键(纯 Shift 组合会抢走"
-                  f"换行/大写/符号输入),已按未设置处理")
+        """把配置算成注册表并重启热键线程。规则全在 plan_hotkeys() 里。"""
+        plan = plan_hotkeys(self._config)
+        from ..log import write
+        if plan.unsafe:
+            write(f"拒绝注册 {len(plan.unsafe)} 个危险热键(纯 Shift 组合会"
+                  f"抢走换行/大写/符号输入),已按未设置处理")
+        if plan.merged:
+            write(f"{' 和 '.join(plan.merged)}的「隐藏键」与「恢复键」是同一个,"
+                  f"已按切换键处理(按一下藏、再按一下恢复)")
         # 键盘组合与鼠标侧键**并存**:手在哪边用哪边
-        self._hotkeys.set_hotkeys(specs, mouse)
+        self._hotkeys.set_hotkeys(plan.specs, plan.mouse)
 
     # ---------------------------------------------------------------- 信号
     def _on_hotkey(self, action: str) -> None:
@@ -506,9 +501,24 @@ class MainWindow(QMainWindow):
             self._toggle_targets()
         elif action == "hide":
             hwnds = self._current_targets()
-            if hwnds:
-                self._controller.hide_hwnds(hwnds)
+            # 把已经藏着的剔掉:否则"隐藏键"按第二次会对着同一批窗口再藏一遍,
+            # 用户看到的是"按了没反应" —— 其实就是没东西可藏了。
+            todo = [h for h in hwnds
+                    if not self._controller.is_hwnd_hidden_or_pending(h)]
+            if todo:
+                self._controller.hide_hwnds(todo)
+            elif self._controller.hidden_hwnds():
+                # 已经藏着东西、没有新的可藏。不说清楚的话用户只会觉得
+                # "这个隐藏键坏了,按了没反应"。
+                self.statusBar().showMessage(
+                    "提示:没有新的可隐藏窗口。要恢复请按「恢复」键,"
+                    "或把恢复键设成和隐藏键一样(那样就成了切换键)", 6000)
+            else:
+                self.statusBar().showMessage(
+                    "提示:没有勾选任何窗口,也没有命中场景规则", 5000)
         elif action == "restore":
+            if not self._controller.hidden_hwnds():
+                self.statusBar().showMessage("提示:当前没有被隐藏的窗口", 3000)
             self._controller.restore_all()
         elif action == "hide_self":
             self._hide_self()

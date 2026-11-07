@@ -169,11 +169,26 @@ class SettingsDialog(QDialog):
             grid.addWidget(ms, i, 2)
             self._hotkey_rows.append((lab, kb, ms))
         v.addLayout(grid)
+        # 「两个键设成同一个」的实时提示。
+        #
+        # 这件事本身是允许的(保存后会退化成切换键),但用户不该靠猜:
+        # 以前两格填一样,RegisterHotKey 只能注册成功一个,侧键还会被字典
+        # 覆盖 —— 用户看到的就是"要么只能隐藏、要么只能恢复",完全不知道
+        # 是自己填重了。
+        self._lbl_same_hint = QLabel()
+        self._lbl_same_hint.setWordWrap(True)
+        self._lbl_same_hint.setStyleSheet("color: #0f766e;")
+        v.addWidget(self._lbl_same_hint)
+        for cap in (self._cap_hide, self._cap_restore,
+                    self._cap_hide_mouse, self._cap_restore_mouse):
+            cap.captured.connect(self._refresh_same_hint)
         # 模式切换时显隐行:选"单一"只显示切换键,
         # 选"两个"才出现隐藏键/恢复键(旧版三个框并列,填了不生效,纯误导)
         self._mode_toggle.toggled.connect(self._sync_hotkey_rows)
         self._mode_split.toggled.connect(self._sync_hotkey_rows)
+        self._mode_split.toggled.connect(self._refresh_same_hint)
         self._sync_hotkey_rows()
+        self._refresh_same_hint()
 
         extra = QGroupBox("附加")
         ev = QVBoxLayout(extra)
@@ -210,6 +225,32 @@ class SettingsDialog(QDialog):
             visible = split if i else not split   # 第 0 行是"切换"
             for w in widgets:
                 w.setVisible(visible)
+
+    def _refresh_same_hint(self, *_args) -> None:
+        """两格填了同一个键时,明说"它会变成切换键"。
+
+        不解释的话,用户保存后只会发现"隐藏能用、恢复没反应"(键盘)或者
+        "只会恢复、藏不了"(侧键) —— 然后以为是 bug。它确实曾经是 bug,
+        现在是有意为之的行为,那就在填的当场说清楚。
+        """
+        if not hasattr(self, "_lbl_same_hint"):
+            return
+        if not self._mode_split.isChecked():
+            self._lbl_same_hint.setText("")
+            return
+        same = []
+        if (self._cap_hide.spec().vk
+                and self._cap_hide.spec() == self._cap_restore.spec()):
+            same.append("键盘组合键")
+        if (self._cap_hide_mouse.spec().vk
+                and self._cap_hide_mouse.spec() == self._cap_restore_mouse.spec()):
+            same.append("鼠标侧键")
+        if same:
+            self._lbl_same_hint.setText(
+                f"{' 和 '.join(same)} 这两格填的是同一个 —— 保存后它会变成"
+                "「切换键」:按一下隐藏、再按一下恢复。想分别控制就填两个不同的键。")
+        else:
+            self._lbl_same_hint.setText("")
 
     def _behavior_tab(self) -> QWidget:
         w = QWidget()

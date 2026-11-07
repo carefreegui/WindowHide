@@ -18,6 +18,7 @@ import ctypes
 import threading
 import time
 from ctypes import wintypes
+from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Signal
 
@@ -221,6 +222,77 @@ def capture_owners() -> int:
 
 
 
+@dataclass
+class HotkeyPlan:
+    """一份配置最终要注册成什么。纯数据,由 `plan_hotkeys()` 产出。"""
+    specs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    mouse: dict[str, int] = field(default_factory=dict)
+    merged: list[str] = field(default_factory=list)   # 哪些键因"两格相同"合并成了切换
+    unsafe: list[str] = field(default_factory=list)   # 被拒绝的危险组合
+
+
+def plan_hotkeys(cfg) -> HotkeyPlan:
+    """把配置算成两张注册表。纯函数,不碰全局状态,方便把规则钉死。
+
+    这里承载了一条很容易被忽略的规则:**隐藏键和恢复键填成同一个时,
+    它就该是切换键**。
+
+    不合并的话两处都只会生效一半,用户看到的就是"要么只能隐藏、要么只能
+    恢复":
+    · 键盘 —— `RegisterHotKey` 对同一个组合只允许注册一次,第二个必然失败
+      (hide 先注册成功,restore 直接被拒);
+    · 侧键 —— 钩子里的 `mouse_map` 是 `vk -> action` 的字典,后写的
+      restore 会把 hide 顶掉,于是侧键永远只能恢复。
+
+    用户的心智模型很简单:"同一个键 = 按一下藏、再按一下恢复"。那就照做,
+    而不是让他去猜为什么有一半没生效。填两个**不同**的键时,语义严格保持
+    "各管各的",不做任何智能推断 —— 想分开就分开。
+    """
+    plan = HotkeyPlan()
+
+    def kb(spec):
+        if not spec.safe:
+            plan.unsafe.append(f"mods=0x{spec.mods:X} vk=0x{spec.vk:02X}")
+            return 0, 0
+        return spec.mods, spec.vk
+
+    def ms(spec):
+        if not spec.safe:
+            plan.unsafe.append(f"mods=0x{spec.mods:X} vk=0x{spec.vk:02X}")
+            return 0
+        return spec.vk if spec.is_mouse else 0
+
+    # "隐藏本工具"(收进托盘)与模式无关,始终注册
+    plan.specs["hide_self"] = kb(cfg.hotkey_hide_self)
+
+    if getattr(cfg, "hotkey_mode", "toggle") == "split":
+        hk, rk = kb(cfg.hotkey_hide), kb(cfg.hotkey_restore)
+        hm, rm = ms(cfg.hotkey_hide_mouse), ms(cfg.hotkey_restore_mouse)
+
+        if hk[1] and hk == rk:
+            plan.specs["toggle"] = hk
+            plan.merged.append("键盘")
+        else:
+            if hk[1]:
+                plan.specs["hide"] = hk
+            if rk[1]:
+                plan.specs["restore"] = rk
+
+        if hm and hm == rm:
+            plan.mouse["toggle"] = hm
+            plan.merged.append("侧键")
+        else:
+            if hm:
+                plan.mouse["hide"] = hm
+            if rm:
+                plan.mouse["restore"] = rm
+    else:
+        plan.specs["toggle"] = kb(cfg.hotkey_toggle)
+        plan.mouse["toggle"] = ms(cfg.hotkey_toggle_mouse)
+
+    return plan
+
+
 def side_button_decision(wparam: int, vk: int, *, capturing: bool,
                          has_action: bool, paired: dict[int, bool]
                          ) -> tuple[bool, str]:
@@ -341,12 +413,22 @@ class HotkeyManager(QObject):
         # 侧键单独一张表:它们不走 RegisterHotKey(那个接口不认识鼠标),
         # 由下面的低级钩子处理。两种来源都收:显式给的 mouse 参数,以及
         # 直接写在 specs 里的侧键(=某些调用方/测试的简写)。
+        #
+        # 一个侧键只能对应一个动作(字典会覆盖),所以同一个侧键被两个动作
+        # 抢的时候必须留下痕迹 —— 否则用户看到的是"恢复键能用了但隐藏键
+        # 没了",完全无从排查。上层已经把"隐藏/恢复同键"合并成 toggle,
+        # 走到这里还冲突就说明是真撞了(比如"隐藏本工具"和"切换"同侧键)。
         mouse_map: dict[int, str] = {}
+        mouse_conflicts: list[str] = []
         for a, (_m, vk) in specs.items():
             if vk in MOUSE_VKS:
+                if vk in mouse_map and mouse_map[vk] != a:
+                    mouse_conflicts.append(f"{hotkey_label(0, vk)}:{mouse_map[vk]}/{a}")
                 mouse_map[vk] = a
         for a, vk in mouse_cfg.items():
             if vk:
+                if vk in mouse_map and mouse_map[vk] != a:
+                    mouse_conflicts.append(f"{hotkey_label(0, vk)}:{mouse_map[vk]}/{a}")
                 mouse_map[vk] = a
 
         def wndproc(hwnd, umsg, wparam, lparam):
@@ -374,9 +456,16 @@ class HotkeyManager(QObject):
         self._hwnd = hwnd
 
         failed = []
+        registered: dict[tuple[int, int], str] = {}   # 已注册的组合 -> 先占它的动作
         for i, (action, (mods, vk)) in enumerate(specs.items()):
             if not vk or vk in MOUSE_VKS:
                 continue      # 侧键交给钩子,RegisterHotKey 不支持
+            if (mods, vk) in registered:
+                # 同一个窗口不能用同一个组合注册两次。上层已经把"隐藏/恢复
+                # 同键"合并成 toggle,走到这里说明真冲突(比如"隐藏本工具"
+                # 和"切换"撞了)。与其重试 5 次白等半秒,不如立刻报出去。
+                failed.append(action)
+                continue
             hid = i + 1
             # 正常路径下 _stop_thread 已 join 等旧线程退干净(其 finally 会
             # UnregisterHotKey),不会冲突。但万一旧线程退出超时(2s)还没死,
@@ -384,6 +473,7 @@ class HotkeyManager(QObject):
             for attempt in range(6):
                 if RegisterHotKey(hwnd, hid, mods | MOD_NOREPEAT, vk):
                     local_map[hid] = action
+                    registered[(mods, vk)] = action
                     break
                 if attempt < 5:
                     time.sleep(0.1)
@@ -478,6 +568,8 @@ class HotkeyManager(QObject):
             # 单独记一行:不然日志里只有键盘键,"侧键没反应"就无从查起
             write("鼠标侧键: " + ", ".join(
                 f"{a}={hotkey_label(0, vk)}" for vk, a in mouse_map.items()))
+        if mouse_conflicts:
+            write("侧键被多个动作抢用(后配置的生效): " + ", ".join(mouse_conflicts))
         if not hook_id:
             write(f"鼠标侧键钩子安装失败(err={hook_err})")
             if mouse_map:
