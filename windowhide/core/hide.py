@@ -78,6 +78,7 @@ class HideController(QObject):
     state_changed = Signal()          # 隐藏状态变化(UI 刷新用)
     action_done = Signal(str, int)    # (action, count) action: hidden/restored/failed
     hide_incomplete = Signal(int, str)  # (藏不掉的窗口数, 原因提示)
+    restore_incomplete = Signal(int, str)  # (没能放回来的窗口数, 原因提示)
     privilege_blocked = Signal(str)   # 目标进程权限比我们高(UIPI 拦死)
     protected_skipped = Signal(str)   # 命中了"永不隐藏"名单,已跳过
     profile_changed = Signal(str)     # 当前场景变了(托盘菜单要更新勾选)
@@ -618,13 +619,20 @@ class HideController(QObject):
             fullscreen = win32.is_fullscreen_window(w.hwnd)
             ex_style, show_cmd = win32.hide_window(w.hwnd,
                                                    allow_minimize=allow_minimize)
-            records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title,
-                                           fullscreen)
             # 判据是"真的不在屏幕上了"(隐藏或最小化),不是 IsWindowVisible ——
             # 全屏游戏被最小化时 IsWindowVisible 依然是 True。
             # 必须等一小会儿:异步 SW_HIDE 刚投递时窗口还是可见的。
-            if not win32.wait_offscreen(w.hwnd, 0.3):
+            #
+            # 🔴 藏不掉就**不留记录**。留了就是"假性隐藏":列表显示已隐藏、
+            # 实际窗口还在屏幕上;用户按恢复时对着一堆假记录空转,而且这些
+            # 假记录还会被写进状态文件、下次启动继续装成"藏着"。宁可如实
+            # 报失败,也不要一个看起来成功、实际什么都没做的状态。
+            if not win32.wait_offscreen(w.hwnd, 0.5):
+                win32.undo_hide(w.hwnd, ex_style, show_cmd)
                 failed += 1
+                continue
+            records[w.hwnd] = WindowRecord(w.hwnd, ex_style, show_cmd, w.title,
+                                           fullscreen)
         if not records:
             return HiddenProcess(pid=pid, process_name=name, hung=hung,
                                  partial=partial) \
@@ -680,55 +688,92 @@ class HideController(QObject):
 
     def _restore_pids_blocking(self, pids: list[int]) -> int:
         done = 0
+        stuck = 0
         for pid in pids:
             with self._lock:
-                hp = self._hidden.pop(pid, None)
+                # 先**不**从 _hidden 里摘:恢复失败时记录必须留着,
+                # 否则窗口还藏着、工具却再也不认识它(用户:藏了回不来、
+                # 列表里也找不到)。
+                hp = self._hidden.get(pid)
                 if self._pending.get(pid) == "restore":
                     self._pending.pop(pid, None)
                 if hp is not None:
-                    for hwnd in hp.records:
+                    for hwnd in list(hp.records):
                         self._pending_hwnd.pop(hwnd, None)
             if not hp:
                 continue
             try:
-                self._restore_one(hp)
+                failed = self._restore_one(hp)
             except Exception:
                 from ..log import write
                 write(f"恢复 pid={pid} 时出现异常:\n{traceback.format_exc()}")
-            done += 1
-        if done:
+                failed = len(hp.records)
+            with self._lock:
+                if hp.records:
+                    self._hidden[pid] = hp      # 还留着没放回来的
+                else:
+                    self._hidden.pop(pid, None)
+            if hp.records:
+                stuck += len(hp.records)
+                from ..log import write
+                write(f"{hp.process_name or pid} 有 {len(hp.records)} 个窗口"
+                      f"没能放回来(目标可能已无响应),记录已保留,可以再试一次")
+            else:
+                done += 1
+        if done or stuck:
             self._save_state()
             self.state_changed.emit()
+        if done:
             self.action_done.emit("restored", done)
+        if stuck:
+            self.restore_incomplete.emit(
+                stuck, "有窗口没能放回来(目标程序可能卡住了)。记录已保留,"
+                       "可以再按一次恢复,或从任务管理器结束该程序。")
         return done
 
-    def _restore_one(self, hp: HiddenProcess) -> None:
-        """整进程恢复:把记录里的窗口全放回来。"""
-        main_hwnd = self._restore_records(hp, None)
+    def _restore_one(self, hp: HiddenProcess) -> int:
+        """整进程恢复:把记录里的窗口全放回来。返回**没能**放回来的数量。"""
+        main_hwnd, failed = self._restore_records(hp, None)
         self._finish_release(hp, main_hwnd)
+        return len(failed)
 
     def _restore_records(self, hp: HiddenProcess,
-                         hwnds: set[int] | None) -> int:
+                         hwnds: set[int] | None) -> tuple[int, list[int]]:
         """恢复 hp 记录里的窗口(`hwnds` 给定时只恢复其中一部分)。
 
-        返回面积最大的那个窗口的 hwnd(整进程释放后拉前台用)。
+        返回 (面积最大的窗口 hwnd, **恢复失败**的 hwnd 列表)。
+
+        注意两个"以前踩过"的地方:
+
+        * 记录必须**恢复成功之后**才从 `hp.records` 里删。以前是先 `pop`
+          再操作,一次失败就永久丢失目标 —— 窗口还在屏幕上藏着,工具却
+          再也没有它的任何痕迹,用户只能去任务管理器杀进程。
+        * `restore_window` 的返回值必须看。异步投递对"不 pump 消息的
+          目标"等于没做,以前一律当成功,于是"藏了回不来"还报"恢复 1 处"。
         """
         main_hwnd = 0
         main_size = -1
+        failed: list[int] = []
         todo = list(hp.records) if hwnds is None else list(hwnds)
         for hwnd in todo:
-            rec = hp.records.pop(hwnd, None)
+            rec = hp.records.get(hwnd)
             if rec is None:
                 continue
             self._retry.pop(hwnd, None)
             if not win32.IsWindow(hwnd):
+                # 窗口真的没了(程序关闭/自己重建了窗口),记录作废。
+                # 这不算"恢复失败":没有可恢复的东西。
+                hp.records.pop(hwnd, None)
                 continue
-            win32.restore_window(hwnd, rec.ex_style, rec.show_cmd)
+            if not win32.restore_window(hwnd, rec.ex_style, rec.show_cmd):
+                failed.append(hwnd)
+                continue        # 🔴 记录留着:用户还能再点一次恢复
+            hp.records.pop(hwnd, None)
             size = win32.get_window_rect(hwnd)
             area = max(0, size[2] - size[0]) * max(0, size[3] - size[1])
             if area > main_size:
                 main_size, main_hwnd = area, hwnd
-        return main_hwnd
+        return main_hwnd, failed
 
     def _finish_release(self, hp: HiddenProcess, main_hwnd: int = 0) -> None:
         """整进程放回后的收尾:取消静音、叫回托盘图标、拉前台。"""
@@ -795,6 +840,7 @@ class HideController(QObject):
 
     def _restore_hwnds_worker(self, hwnds: list[int]) -> int:
         done = 0
+        stuck = 0
         try:
             for hwnd in hwnds:
                 with self._lock:
@@ -803,10 +849,17 @@ class HideController(QObject):
                 if hp is None:
                     continue
                 try:
-                    main_hwnd = self._restore_records(hp, {hwnd})
+                    main_hwnd, failed = self._restore_records(hp, {hwnd})
                 except Exception:
                     from ..log import write
                     write(f"恢复 hwnd={hwnd} 时出现异常:\n{traceback.format_exc()}")
+                    continue
+                if failed:
+                    # 没放回来:记录留着,静音和托盘图标也别动
+                    # (窗口还藏着的时候把托盘图标叫回来 = 自己暴露了)
+                    stuck += len(failed)
+                    with self._lock:
+                        self._hidden[hp.pid] = hp
                     continue
                 done += 1
                 with self._lock:
@@ -824,10 +877,15 @@ class HideController(QObject):
                 for hwnd in hwnds:
                     if self._pending_hwnd.get(hwnd) == "restore":
                         self._pending_hwnd.pop(hwnd, None)
-        if done:
+        if done or stuck:
             self._save_state()
             self.state_changed.emit()
+        if done:
             self.action_done.emit("restored", done)
+        if stuck:
+            self.restore_incomplete.emit(
+                stuck, "有窗口没能放回来(目标程序可能卡住了)。记录已保留,"
+                       "可以再按一次恢复,或从任务管理器结束该程序。")
         return done
 
     def restore_hwnd(self, hwnd: int, wait: bool = False) -> bool:

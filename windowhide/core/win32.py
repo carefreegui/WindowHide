@@ -937,7 +937,7 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
             # WS_POPUP 的游戏窗口没有任务栏按钮、也不在 Alt+Tab 里,
             # 用户根本点不回来(永劫无间实测就是这么卡死的)。
             # 全有或全无 —— 撤回到原样,让上层如实报"没藏掉"。
-            _undo_hide(hwnd, ex_style, show_cmd)
+            undo_hide(hwnd, ex_style, show_cmd)
         return ex_style, show_cmd
 
     ShowWindowAsync(hwnd, SW_HIDE)
@@ -952,7 +952,7 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
     return ex_style, show_cmd
 
 
-def _undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
+def undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
     """把没藏干净的操作撤回原样(去样式 + 拉回显示)。"""
     if not is_hung(hwnd):
         set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
@@ -965,8 +965,35 @@ def _undo_hide(hwnd: int, ex_style: int, show_cmd: int) -> None:
                  | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS)
 
 
-def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
-    """恢复窗口:还原扩展样式,再按记录的命令显示。"""
+def _wait_visible(hwnd: int, timeout: float) -> bool:
+    """等窗口真的回到可见状态,最多 timeout 秒。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        if IsWindowVisible(hwnd):
+            return True
+        if not IsWindow(hwnd):
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.04)
+
+
+def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> bool:
+    """恢复窗口:还原扩展样式,再按记录的命令显示。**返回是否确认已可见**。
+
+    两条铁律,都是"藏了回不来"之后补的:
+
+    1. **样式无条件还原**。`SetWindowLongPtr(GWL_EXSTYLE)` 只是改窗口对象
+       里的一个字段,由 USER32 自己改,不需要目标线程处理任何消息 —— 所以
+       它绝不该跟着 `is_hung` 一起跳过。以前恰恰把它关在 `if not is_hung`
+       里面:游戏被藏起来之后就不再 pump 消息(`IsHungAppWindow` 返回 True
+       是常态),于是 TOOLWINDOW 永远摘不掉,就算窗口显示出来也永远不在
+       任务栏和 Alt+Tab 里。
+
+    2. **必须校验真的回来了**。异步投递对"不 pump 消息的目标"完全无效,
+       投完就当成功、记录一清,这个窗口就再也找不回来了(用户原话:
+       "在工具里直接看不到它的进程了,任务管理器里还在跑")。
+    """
     cmd = show_cmd
     if cmd in (SW_HIDE, SW_SHOWMINNOACTIVE, SW_MINIMIZE):
         cmd = SW_SHOWNORMAL
@@ -975,19 +1002,36 @@ def restore_window(hwnd: int, ex_style: int, show_cmd: int) -> None:
     elif cmd in (SW_SHOWNOACTIVATE, SW_SHOWNA):
         cmd = SW_SHOWNOACTIVATE
 
+    # ① 还样式 —— 无条件,不等任何人
+    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                 add=ex_style & WS_EX_TOOLWINDOW)
+
+    if IsWindowVisible(hwnd) and not IsIconic(hwnd):
+        return True
+
+    # ② 同步改放置状态。只在目标还处理消息时走:SetWindowPlacement 会等
+    #    目标处理 WM_WINDOWPOSCHANGING,目标是死的就把调用线程一起拖住。
     if not is_hung(hwnd):
-        set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
-                     add=ex_style & WS_EX_TOOLWINDOW)
-        # SetWindowPlacement 直接改状态:被最小化的全屏游戏对
-        # ShowWindow(SW_SHOWNORMAL) 可能毫无反应(实测永劫无间)。
         if set_placement_cmd(hwnd, cmd):
             _ensure_maximized(hwnd, cmd)
-            return
-    # 目标未响应 / 改状态失败:只能投递异步请求,绝不在这里等
+            if _wait_visible(hwnd, 0.3):
+                return True
+
+    # ③ 异步投递:快,但目标不 pump 消息就等于没投
     ShowWindowAsync(hwnd, cmd)
     SetWindowPos(hwnd, None, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
                  | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS)
+    if _wait_visible(hwnd, 0.6):
+        return True
+
+    # ④ 兜底:同步 ShowWindow。对未响应窗口它会阻塞几秒 —— 但调用方在
+    #    工作线程里,界面不会冻;而"藏了回不来"是用户绝对不能接受的结局。
+    #    ShowWindow 内部对 WS_VISIBLE 的修改在调用线程完成,只要目标不是
+    #    彻底死锁,窗口就能亮起来。
+    if IsWindow(hwnd):
+        ShowWindow(hwnd, cmd)
+    return _wait_visible(hwnd, 1.2)
 
 
 def is_hidden(hwnd: int) -> bool:

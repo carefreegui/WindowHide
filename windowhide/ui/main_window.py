@@ -121,6 +121,7 @@ class MainWindow(QMainWindow):
         self._controller.state_changed.connect(self.refresh)
         self._controller.action_done.connect(self._on_action)
         self._controller.hide_incomplete.connect(self._on_hide_incomplete)
+        self._controller.restore_incomplete.connect(self._on_restore_incomplete)
         self._controller.privilege_blocked.connect(self._on_privilege_blocked)
         self._controller.protected_skipped.connect(self._on_protected_skipped)
         self._controller.profile_changed.connect(self._on_profile_changed)
@@ -130,6 +131,7 @@ class MainWindow(QMainWindow):
         self._tray.act_toggle.triggered.connect(self._toggle_targets)
         self._tray.act_hide_self.triggered.connect(self._hide_self)
         self._tray.act_show.triggered.connect(self._show_window)
+        self._tray.act_rescue.triggered.connect(self._rescue_orphans)
         self._tray.act_elevate.triggered.connect(self._restart_as_admin)
         self._tray.act_quit.triggered.connect(self._quit)
         self._tray.activated.connect(self._on_tray_activated)
@@ -623,6 +625,84 @@ class MainWindow(QMainWindow):
         self._tray.showMessage("部分窗口未能隐藏", hint)
         from ..log import write
         write("界面提示: " + hint)
+
+    def _on_restore_incomplete(self, count: int, hint: str) -> None:
+        """有窗口没放回来时必须说出来。
+
+        静默失败在这一侧比隐藏那一侧更致命:用户以为窗口还好好藏在后台,
+        实际上既看不见、列表里又可能已经找不到,只剩任务管理器能救。
+        """
+        self.statusBar().showMessage("警告:" + hint)
+        self._tray.showMessage("部分窗口未能恢复", hint)
+        from ..log import write
+        write("界面提示: " + hint)
+
+    def _rescue_orphans(self) -> None:
+        """不依赖任何隐藏记录,把"看着像我们藏过"的窗口放回来。
+
+        这一项是给最坏情况准备的:程序被强杀、恢复中途出错、状态文件被
+        覆盖 —— 只要窗口还藏在系统里,主界面就永远不会再列出它(列表是
+        按"可见 或 在隐藏记录里"筛的),用户除了任务管理器杀进程没有别的路。
+
+        判据只有一条:`不可见 + 带 WS_EX_TOOLWINDOW + 体积足够大`。
+        我们藏窗口时一定加 TOOLWINDOW、恢复成功一定摘掉,所以这个组合
+        就是我留下的现场。但真正最小化到托盘的软件也可能是这个组合,
+        所以**必须让用户确认**,绝不自己闷头恢复。
+        """
+        known = self._controller.hidden_hwnds()
+        our_pid = win32.get_window_pid(int(self.winId()))
+        cands: list[WindowInfo] = []
+        try:
+            for w in win32.enum_top_level_windows():
+                if w.hwnd in known or w.pid == our_pid:
+                    continue
+                if w.visible or w.minimized:
+                    continue
+                if not (w.ex_style & win32.WS_EX_TOOLWINDOW):
+                    continue
+                r = w.rect
+                if r[2] - r[0] < 400 or r[3] - r[1] < 300:
+                    continue
+                if win32.is_shell_window(w.hwnd):
+                    continue
+                cands.append(w)
+        except Exception:
+            return
+
+        if not cands:
+            QMessageBox.information(
+                self, "找回被藏的窗口",
+                "没有找到疑似被隐藏的窗口。\n\n"
+                "（只检查「不可见 + 带工具窗样式 + 尺寸大于 400x300」的窗口）")
+            return
+
+        lines = [f"· {w.process_name or w.pid}   {w.title or '(无标题)'}   "
+                 f"{w.rect[2] - w.rect[0]}×{w.rect[3] - w.rect[1]}"
+                 for w in cands[:12]]
+        more = f"\n…还有 {len(cands) - 12} 个" if len(cands) > 12 else ""
+        ans = QMessageBox.question(
+            self, "找回被藏的窗口",
+            f"找到 {len(cands)} 个「不可见 + 带工具窗样式」的大窗口：\n\n"
+            + "\n".join(lines) + more
+            + "\n\n它们可能被本工具藏起来了，也可能只是最小化到了托盘。\n"
+              "要把它们的窗口放回屏幕吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+
+        n = 0
+        for w in cands:
+            # 第二个参数传 0:只摘掉 TOOLWINDOW,不额外加任何样式位。
+            if win32.restore_window(w.hwnd, 0, win32.SW_SHOWNORMAL):
+                n += 1
+        self.statusBar().showMessage(
+            f"已找回 {n} / {len(cands)} 个窗口", 8000)
+        from ..log import write
+        write(f"手动救援:候选 {len(cands)} 个,成功放回 {n} 个")
+        if n < len(cands):
+            self._tray.showMessage(
+                "找回被藏的窗口",
+                f"有 {len(cands) - n} 个窗口没放回来,可能目标程序已经卡住。")
 
     def _on_privilege_blocked(self, msg: str) -> None:
         """目标权限比我们高:说清原因,别让用户以为工具坏了。"""
