@@ -750,7 +750,10 @@ class MainWindow(QMainWindow):
             for w in win32.enum_top_level_windows():
                 if w.hwnd in known or w.pid == our_pid:
                     continue
-                if w.visible or w.minimized:
+                # 隐形隐藏(DWM 不画它)的窗口**仍然是 visible**,所以除了
+                # "不可见"这一条,还要认"被合成器隐去了"这个指纹。
+                region_hidden = win32.has_region(w.hwnd)
+                if not region_hidden and (w.visible or w.minimized):
                     continue
                 if not (w.ex_style & win32.WS_EX_TOOLWINDOW):
                     continue
@@ -786,6 +789,9 @@ class MainWindow(QMainWindow):
 
         n = 0
         for w in cands:
+            # 被合成器隐去的窗口,先取消隐去 —— 否则"恢复了"也还是看不见。
+            if win32.has_region(w.hwnd):
+                win32.clear_region(w.hwnd)
             # 第二个参数传 0:只摘掉 TOOLWINDOW,不额外加任何样式位。
             if win32.restore_window(w.hwnd, 0, win32.SW_SHOWNORMAL):
                 n += 1

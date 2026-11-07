@@ -14,6 +14,7 @@ from dataclasses import dataclass
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 shell32 = ctypes.windll.shell32
+dwmapi = ctypes.windll.dwmapi
 
 # ---------------------------------------------------------------- 常量
 GW_OWNER = 4
@@ -1037,6 +1038,47 @@ def hide_window(hwnd: int, allow_minimize: bool = False) -> tuple[int, int]:
 SOFT_HIDE_POS = -32000      # 软隐藏时把窗口挪到这里(远在虚拟桌面之外)
 GA_ROOT = 2                 # GetAncestor:取最顶层祖先(判断"这点上是谁")
 
+# 空窗口区域:SetWindowRgn 到"空区域"= 这块画面什么都不画,而窗口本身
+# 完全不知情(位置、大小、WS_VISIBLE、样式全都原样)。这是对付"钉死自己
+# 位置的全屏游戏"的手段 —— 位置改不动,区域它管不着。
+#
+# 注意:**它必须跨进程可用**。实测 `SetWindowRgn` 对别的进程的全屏窗口
+# 返回成功、画面真的消失、清空区域后复原。(对照:DWMWA_CLOAK 只对自己
+# 进程的窗口有效,对别人的窗口返回 0x80070005/0x80070006 —— 别再试它。)
+
+
+def _gdi():
+    return ctypes.windll.gdi32
+
+
+def has_region(hwnd: int) -> bool:
+    """窗口现在有没有被设过区域(非 NULL)。"""
+    gdi = _gdi()
+    probe = gdi.CreateRectRgn(0, 0, 0, 0)
+    try:
+        # 返回 0(ERROR)= 没有区域(或区域为空);非 0 = 有区域
+        return bool(user32.GetWindowRgn(wintypes.HWND(hwnd), probe))
+    finally:
+        gdi.DeleteObject(probe)
+
+
+def set_empty_region(hwnd: int) -> bool:
+    """把窗口可见区域设成空 —— 画面上什么都不出现。"""
+    gdi = _gdi()
+    rgn = gdi.CreateRectRgn(0, 0, 0, 0)
+    # 成功后 region 归系统所有,不能再 DeleteObject
+    return bool(user32.SetWindowRgn(wintypes.HWND(hwnd), wintypes.HANDLE(rgn), True))
+
+
+def clear_region(hwnd: int) -> bool:
+    """还原成默认区域(整扇窗都画)。
+
+    代价说明:如果程序原本自己设过复杂区域(圆角/异形窗),我们会把它还原成
+    矩形而不是原样 —— 所以 hide_region 里记了 `had_region`,遇到这种窗口
+    就不碰它,免得把人家外观弄坏。
+    """
+    return bool(user32.SetWindowRgn(wintypes.HWND(hwnd), None, True))
+
 
 def covers_screen_center(hwnd: int) -> bool:
     """这个窗口现在还占着**屏幕上的要害位置**吗?(= 用户其实还看得见它)
@@ -1090,8 +1132,19 @@ def push_offscreen(hwnd: int, sync: bool = False) -> bool:
     flags = (SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
     if not sync:
         flags |= SWP_ASYNCWINDOWPOS
-    return bool(SetWindowPos(hwnd, None, SOFT_HIDE_POS, SOFT_HIDE_POS,
-                             0, 0, flags))
+    ok = bool(SetWindowPos(hwnd, None, SOFT_HIDE_POS, SOFT_HIDE_POS,
+                           0, 0, flags))
+    if not ok:
+        # 记下来:全屏游戏"挪不动"有两种完全不同的原因 —— 调用本身被拒
+        # (权限/独占显示),或者调用成功但窗口把位置钉死了。混淆这两者
+        # 会让人往完全错误的方向修。日志里必须有这个返回值。
+        try:
+            from ..log import write
+            write(f"SetWindowPos 挪窗口失败 hwnd={hwnd:#x} "
+                  f"err={kernel32.GetLastError()}")
+        except Exception:       # noqa: BLE001
+            pass
+    return ok
 
 
 def settle_offscreen(hwnd: int, timeout: float = 0.55,
@@ -1118,6 +1171,57 @@ def soft_hidden_ok(hwnd: int, timeout: float = 0.55,
     if not settle_offscreen(hwnd, timeout, hold):
         return False
     return not covers_screen_center(hwnd)
+
+
+def hide_region(hwnd: int) -> tuple[int, tuple[int, int, int, int], bool]:
+    """区域隐藏:把窗口可见区域设成空。返回 (原样式, 原矩形, 成功?)。
+
+    这是"钉死自己位置的全屏游戏"的出路。实测永劫无间全屏时 `SetWindowPos`
+    一次都改不动(矩形全程 `(0,0,2560,1440)` 不变,它在 `WM_WINDOWPOSCHANGING`
+    里就把位置钉死了),而窗口区域是**窗口管理器**的事,应用拦不住。
+
+    窗口本身完全不知情:不改位置、不改大小、不改 `WS_VISIBLE`,
+    引擎照常渲染,恢复 = 清空区域让它重新露面。
+
+    本来自己就设过区域(异形窗/圆角窗)的**不碰** —— 那种窗口我们没法
+    原样还原,弄坏了外观比藏不住更糟。
+    """
+    ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    rect = get_window_rect(hwnd)
+    if has_region(hwnd):
+        return ex, rect, False
+    if not set_empty_region(hwnd):
+        try:
+            from ..log import write
+            write(f"SetWindowRgn 失败 hwnd={hwnd:#x} err={kernel32.GetLastError()}")
+        except Exception:       # noqa: BLE001
+            pass
+        return ex, rect, False
+    # 加上 TOOLWINDOW 一起做:否则 Alt+Tab / 任务栏里还留着它的名字
+    set_ex_style(hwnd, add=WS_EX_TOOLWINDOW)
+    time.sleep(0.15)
+    ok = not covers_screen_center(hwnd)
+    if not ok:
+        # 区域设了却还占着画面(独占 flip 模式下有可能):如实回滚
+        clear_region(hwnd)
+        set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                     add=ex & WS_EX_TOOLWINDOW)
+        try:
+            from ..log import write
+            write(f"设了空区域但画面没变(hwnd={hwnd:#x}),这条对它无效")
+        except Exception:       # noqa: BLE001
+            pass
+    return ex, rect, ok
+
+
+def restore_region(hwnd: int, ex_style: int) -> bool:
+    """取消区域隐藏:清空区域让它重新露面 + 摘掉 TOOLWINDOW。"""
+    if not IsWindow(hwnd):
+        return False
+    ok = clear_region(hwnd)
+    set_ex_style(hwnd, remove=WS_EX_TOOLWINDOW,
+                 add=ex_style & WS_EX_TOOLWINDOW)
+    return ok
 
 
 def hide_soft(hwnd: int) -> tuple[int, tuple[int, int, int, int], bool]:
