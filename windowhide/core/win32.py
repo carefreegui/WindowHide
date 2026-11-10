@@ -1649,6 +1649,21 @@ CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
 CallNextHookEx.restype = ctypes.c_ssize_t
 
 
+# ---------------------------------------------------------------- 键盘"旁听"
+# 纯 Shift 组合(Shift+Enter 换行、Shift+字母大写)和单个 F 键,用户明确要求
+# 可以拿来当热键 —— 但 `RegisterHotKey` 是**系统层截获**,注册成功原程序就
+# 再也收不到那个键。想做到"两个都触发",只能不走 RegisterHotKey,改用
+# `WH_KEYBOARD_LL` 旁听:看到就发信号,然后**无条件放行**给下面的程序。
+#
+# 代价:这个钩子挂在全系统的键盘输入通路上,回调必须立即返回。所以回调里
+# 只有几次整数比较 + 一个字典查找,绝不碰文件、锁、阻塞调用。
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+
+
 class MSLLHOOKSTRUCT(ctypes.Structure):
     """低级鼠标钩子回调里的 lParam 指过来的结构。"""
     _fields_ = [
@@ -1668,6 +1683,27 @@ def xbutton_of(lparam: int) -> int:
     data = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
     n = (int(data.mouseData) >> 16) & 0xFFFF
     return n if n in (XBUTTON1, XBUTTON2) else 0
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    """低级键盘钩子回调里的 lParam 指过来的结构。"""
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+def kb_vk_of(lparam: int) -> int:
+    """钩子事件里的虚拟键码。
+
+    注意这里给的是**具体键**:左 Shift 是 `VK_LSHIFT(0xA0)` 而不是
+    `VK_SHIFT(0x10)`;修饰键必须先归一化再和配置里的位掩码比。
+    """
+    kb = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+    return int(kb.vkCode)
 
 
 # 鼠标捕获的应急释放。

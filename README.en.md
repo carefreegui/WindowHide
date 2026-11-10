@@ -44,6 +44,14 @@ No DLL injection, no global hooks, no synthetic input: only documented Win32 API
   (`IsHungAppWindow`). A stuck target can no longer freeze the UI.
 - **Mute on hide** — mutes the target program through the system volume mixer,
   including its child processes (browsers play audio in a child process).
+- **Any shortcut you like, including system-standard ones** — combos with
+  Ctrl / Alt / Win are registered exclusively (they become yours system-wide).
+  Combos without them (`Shift+Enter`, a bare `F8`) are *not* exclusive: they go
+  through a low-level keyboard hook that only listens, so the original function
+  still fires — `Shift+Enter` still inserts a newline *and* toggles hiding.
+  The settings dialog says this the moment you press the keys instead of blocking
+  you. Prefer rarely-used keys (`Shift+F8` over `Shift+Enter`) and it stays out of
+  your way.
 - **Mouse side buttons work as hotkeys** — bound through a low-level mouse hook and
   active **alongside** the keyboard combo. Whichever hand is free is the one that
   works; nothing to move first. The side button you bind is consumed by the tool, so

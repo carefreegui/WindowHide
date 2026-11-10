@@ -32,6 +32,8 @@ from .win32 import (
     SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, xbutton_of,
     WH_MOUSE_LL, HC_ACTION, WM_XBUTTONDOWN, WM_XBUTTONUP,
     XBUTTON1, XBUTTON2,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    kb_vk_of,
 )
 
 WM_APP = 0x8000
@@ -267,70 +269,67 @@ def capture_owners() -> int:
 @dataclass
 class HotkeyPlan:
     """一份配置最终要注册成什么。纯数据,由 `plan_hotkeys()` 产出。"""
-    specs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    specs: dict[str, tuple[int, int]] = field(default_factory=dict)    # 独占(RegisterHotKey)
+    shadow: dict[str, tuple[int, int]] = field(default_factory=dict)   # 旁听(键盘钩子)
     mouse: dict[str, int] = field(default_factory=dict)
     merged: list[str] = field(default_factory=list)   # 哪些键因"两格相同"合并成了切换
-    unsafe: list[str] = field(default_factory=list)   # 被拒绝的危险组合
+    unsafe: list[str] = field(default_factory=list)   # 历史字段,现已不填(见下)
 
 
 def plan_hotkeys(cfg) -> HotkeyPlan:
-    """把配置算成两张注册表。纯函数,不碰全局状态,方便把规则钉死。
+    """把配置算成三张表。纯函数,不碰全局状态,方便把规则钉死。
 
-    这里承载了一条很容易被忽略的规则:**隐藏键和恢复键填成同一个时,
-    它就该是切换键**。
+    **三张表分别对应三种触发机制**,这不是分类癖,而是被迫的:
+    · `specs`  —— 带 Ctrl/Alt/Win,走 `RegisterHotKey`(系统层截获,零延迟)
+    · `shadow` —— 纯 Shift / 单个功能键,走 `WH_KEYBOARD_LL` 旁听(不截获,
+                  原程序照常收到 = "两个都触发")
+    · `mouse`  —— 鼠标侧键,同样走钩子,而且要**吃掉**事件
 
-    不合并的话两处都只会生效一半,用户看到的就是"要么只能隐藏、要么只能
-    恢复":
-    · 键盘 —— `RegisterHotKey` 对同一个组合只允许注册一次,第二个必然失败
-      (hide 先注册成功,restore 直接被拒);
-    · 侧键 —— 钩子里的 `mouse_map` 是 `vk -> action` 的字典,后写的
-      restore 会把 hide 顶掉,于是侧键永远只能恢复。
+    以前这里把 `shadow` 那一类直接判成 `unsafe` 丢掉。用户后来说得很清楚:
+    「Shift+Enter 其实特别好操作,你反而多了三个键之后没那么顺畅,稍微占用
+    一点也可以,同时触发也可以,提醒一下就行」。那就别拦,换机制。
 
-    用户的心智模型很简单:"同一个键 = 按一下藏、再按一下恢复"。那就照做,
-    而不是让他去猜为什么有一半没生效。填两个**不同**的键时,语义严格保持
-    "各管各的",不做任何智能推断 —— 想分开就分开。
+    另一条老规则必须保留:**隐藏键和恢复键填成同一个时,它就该是切换键**
+    (键盘 RegisterHotKey 对同一组合只允许注册一次,侧键字典会互相覆盖,
+    用户看到的是"要么只能隐藏、要么只能恢复")。
     """
     plan = HotkeyPlan()
 
-    def kb(spec):
-        if not spec.safe:
-            plan.unsafe.append(f"mods=0x{spec.mods:X} vk=0x{spec.vk:02X}")
-            return 0, 0
-        return spec.mods, spec.vk
-
-    def ms(spec):
-        if not spec.safe:
-            plan.unsafe.append(f"mods=0x{spec.mods:X} vk=0x{spec.vk:02X}")
-            return 0
-        return spec.vk if spec.is_mouse else 0
+    def put(action: str, spec) -> None:
+        """按机制分派一个键盘槽。没设置就什么都不做。"""
+        if spec is None or not spec.valid or spec.is_mouse:
+            return          # 侧键由调用方的 mouse 参数处理,这里只收键盘
+        if spec.shadow:
+            plan.shadow[action] = (spec.mods, spec.vk)
+        else:
+            plan.specs[action] = (spec.mods, spec.vk)
 
     # "隐藏本工具"(收进托盘)与模式无关,始终注册
-    plan.specs["hide_self"] = kb(cfg.hotkey_hide_self)
+    put("hide_self", cfg.hotkey_hide_self)
 
     if getattr(cfg, "hotkey_mode", "toggle") == "split":
-        hk, rk = kb(cfg.hotkey_hide), kb(cfg.hotkey_restore)
-        hm, rm = ms(cfg.hotkey_hide_mouse), ms(cfg.hotkey_restore_mouse)
+        hk, rk = cfg.hotkey_hide, cfg.hotkey_restore
+        hm, rm = cfg.hotkey_hide_mouse, cfg.hotkey_restore_mouse
 
-        if hk[1] and hk == rk:
-            plan.specs["toggle"] = hk
+        if hk.valid and hk == rk:
+            put("toggle", hk)
             plan.merged.append("键盘")
         else:
-            if hk[1]:
-                plan.specs["hide"] = hk
-            if rk[1]:
-                plan.specs["restore"] = rk
+            put("hide", hk)
+            put("restore", rk)
 
-        if hm and hm == rm:
-            plan.mouse["toggle"] = hm
+        if hm.valid and hm == rm:
+            plan.mouse["toggle"] = hm.vk
             plan.merged.append("侧键")
         else:
-            if hm:
-                plan.mouse["hide"] = hm
-            if rm:
-                plan.mouse["restore"] = rm
+            if hm.valid:
+                plan.mouse["hide"] = hm.vk
+            if rm.valid:
+                plan.mouse["restore"] = rm.vk
     else:
-        plan.specs["toggle"] = kb(cfg.hotkey_toggle)
-        plan.mouse["toggle"] = ms(cfg.hotkey_toggle_mouse)
+        put("toggle", cfg.hotkey_toggle)
+        if cfg.hotkey_toggle_mouse.valid:
+            plan.mouse["toggle"] = cfg.hotkey_toggle_mouse.vk
 
     return plan
 
@@ -362,6 +361,52 @@ def side_button_decision(wparam: int, vk: int, *, capturing: bool,
     return (paired.pop(vk, None) is True), ""
 
 
+# 物理修饰键 -> 配置里的位掩码。
+#
+# 低级键盘钩子报的是**具体键**:左 Shift 是 0xA0 而不是 0x10。不归一化的话
+# 用户同时按 Shift+Enter 永远匹配不上配置里的 MOD_SHIFT。
+MOD_VK_BITS = {
+    0xA0: MOD_SHIFT, 0xA1: MOD_SHIFT, 0x10: MOD_SHIFT,
+    0xA2: MOD_CONTROL, 0xA3: MOD_CONTROL, 0x11: MOD_CONTROL,
+    0xA4: MOD_ALT, 0xA5: MOD_ALT, 0x12: MOD_ALT,
+    0x5B: MOD_WIN, 0x5C: MOD_WIN,
+}
+
+
+def shadow_step(wparam: int, vk: int, mods_down: int,
+                table: dict[tuple[int, int], str],
+                fired: set[tuple[int, int]]) -> tuple[int, str]:
+    """旁听热键的状态机,走一步。返回 (新的修饰键状态, 要执行的动作或 "")。
+
+    纯函数,把三个最容易错的点钉死:
+    1. **修饰键归一化**(见 MOD_VK_BITS);
+    2. **按住不放不能连续触发** —— 按住会连续来 WM_KEYDOWN,`fired` 记住
+       已经触发过的组合,任何键抬起时清空;
+    3. **修饰键状态一变,旧组合作废** —— 否则"按住 Shift → 松开 Shift →
+       再按 Enter"会把残留的 (SHIFT, Enter) 当成还按着 Shift。
+
+    `table` 的 key 是 (mods 位掩码, vk),值为动作名。**永远不吞事件** ——
+    调用方拿到动作后照样 CallNextHookEx,这正是"两个都触发"的实现方式。
+    """
+    bit = MOD_VK_BITS.get(vk)
+    down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+    if bit:
+        if down:
+            mods_down |= bit
+        else:
+            mods_down &= ~bit
+            fired.clear()
+        return mods_down, ""
+    if down:
+        key = (mods_down, vk)
+        if key in fired:
+            return mods_down, ""      # 自动重复,不是新的一次按下
+        fired.add(key)
+        return mods_down, table.get(key, "")
+    fired.clear()                     # 任何其它键抬起 = 一次组合结束
+    return mods_down, ""
+
+
 def hotkey_label(mods: int, vk: int) -> str:
     """格式化为 'Ctrl + Alt + H' / '鼠标侧键 1(后退键)'。"""
     if not vk:
@@ -389,6 +434,7 @@ class HotkeyManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._specs: dict[str, tuple[int, int]] = {}   # action -> (mods, vk)
+        self._shadow: dict[tuple[int, int], str] = {}  # (mods, vk) -> action,旁听
         self._mouse: dict[str, int] = {}               # action -> 侧键伪 VK
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -400,24 +446,30 @@ class HotkeyManager(QObject):
 
     # ------------------------------------------------------------ 公共接口
     def set_hotkeys(self, specs: dict[str, tuple[int, int]],
-                    mouse: dict[str, int] | None = None) -> None:
+                    mouse: dict[str, int] | None = None,
+                    shadow: dict[str, tuple[int, int]] | None = None) -> None:
         """设置热键表并重启注册线程。
 
-        specs: action -> (mods, vk),键盘组合键。
+        specs: action -> (mods, vk),走 `RegisterHotKey`(**独占**)。
         mouse: action -> 侧键伪 VK(0 = 这个动作不配侧键)。
+        shadow: action -> (mods, vk),走键盘钩子**旁听** —— 原程序照常收到
+                这个键,本工具也同时触发。纯 Shift 组合和单个功能键走这里。
 
-        两者是**并存**关系而不是二选一:同一个动作可以既挂键盘组合、又挂
+        三者是**并存**关系而不是互斥:同一个动作可以既挂键盘组合、又挂
         鼠标侧键,哪个在手边用哪个。这也正是老板键的使用姿势 —— 藏窗口
         往往是一瞬间的事,没时间去把另一只手挪过来。
         """
         with self._lock:
             self._specs = dict(specs)
             self._mouse = dict(mouse or {})
+            # 旁听表反转成 (mods, vk) -> action:钩子回调里每一步都要查,
+            # 现算就是每按一个键多一次字典构造。
+            self._shadow = {(m, v): a for a, (m, v) in (shadow or {}).items()}
             # 应用新配置 = 这些热键该生效,不管之前是不是因为录入被暂停过
             self._paused = False
             self._stop_thread()
             if (any(vk for _, vk in specs.values())
-                    or any(self._mouse.values())):
+                    or any(self._mouse.values()) or self._shadow):
                 self._thread = threading.Thread(target=self._run, daemon=True)
                 self._thread.start()
 
@@ -493,6 +545,7 @@ class HotkeyManager(QObject):
     def _run(self) -> None:
         with self._lock:
             specs = dict(self._specs)
+            shadow_cfg = dict(self._shadow)
             mouse_cfg = dict(self._mouse)
             self._class_seq += 1
             # 类名必须唯一:同名类第二次 RegisterClassW 必然失败。
@@ -558,7 +611,9 @@ class HotkeyManager(QObject):
         wc.lpfnWndProc = ctypes.cast(proc, ctypes.c_void_p)
         wc.hInstance = hinstance
         wc.lpszClassName = class_name
-        wanted = [a for a in specs if specs[a][1]]
+        wanted_reg = [a for a in specs if specs[a][1]]
+        # 启动失败要报"所有本该生效"的动作,旁听的也算
+        wanted = wanted_reg + list(shadow_cfg.values())
         if not RegisterClassW(ctypes.byref(wc)):
             self._thread_failed(wanted, "窗口类注册失败")
             return
@@ -677,8 +732,69 @@ class HotkeyManager(QObject):
         except Exception:
             hook_id, hook_err = 0, -1
 
+        # ---- 键盘"旁听"钩子 ----
+        #
+        # 只给 shadow 里那几组装。它们被明确排除在 RegisterHotKey 之外:
+        # 系统层截获会让原程序收不到这个键(Shift+Enter 不再换行),
+        # 而用户要的是"两个都触发"。钩子正好能只旁听 —— 看完了照样
+        # CallNextHookEx 放行给下面的程序。
+        #
+        # 这个钩子挂在**全系统的键盘输入通路上**,所以回调里只做几件极便宜
+        # 的事:整数比较、一次字典查找、发一个跨线程信号。绝不碰文件/锁。
+        kbd_hook = 0
+        kbd_proc = None
+        if shadow_cfg:
+            mods_down = 0
+            fired: set[tuple[int, int]] = set()
+
+            def kbd_proc_fn(ncode, wparam, lparam):
+                global _hook_errors
+                try:
+                    if (_hook_errors < HOOK_ERROR_LIMIT
+                            and ncode == HC_ACTION
+                            and wparam in (WM_KEYDOWN, WM_KEYUP,
+                                           WM_SYSKEYDOWN, WM_SYSKEYUP)):
+                        nonlocal mods_down
+                        mods_down, action = shadow_step(
+                            wparam, kb_vk_of(lparam), mods_down,
+                            shadow_cfg, fired)
+                        # 录入态里只更新状态、不触发 —— 否则在设置页按
+                        # Shift+Enter 想改键,反而先把窗口藏了一遍。
+                        if action and not _capture_active():
+                            self.triggered.emit(action)
+                except Exception as exc:            # noqa: BLE001
+                    _hook_errors += 1
+                    if _hook_errors <= 3:
+                        try:
+                            write(f"键盘钩子回调异常({_hook_errors}/"
+                                  f"{HOOK_ERROR_LIMIT}),已按放行处理: {exc!r}")
+                        except Exception:
+                            pass
+                # ⚠️ 永远放行。这里 `return 1` 就等于回到"独占热键",
+                # 用户按 Shift+Enter 换行就没了 —— 那正是要避免的事。
+                return CallNextHookEx(0, ncode, wparam, lparam)
+
+            try:
+                kbd_proc = LOWLEVELHOOKPROC(kbd_proc_fn)
+                kbd_hook = SetWindowsHookExW(
+                    WH_KEYBOARD_LL, ctypes.cast(kbd_proc, ctypes.c_void_p),
+                    hinstance, 0)
+                if not kbd_hook:
+                    write(f"键盘旁听钩子安装失败(err={kernel32.GetLastError()}),"
+                          f"这些组合将不生效: "
+                          + ", ".join(f"{a}={hotkey_label(*s)}"
+                                      for (m, v), a in shadow_cfg.items()
+                                      for s in [(m, v)]))
+                    self.register_failed.emit(",".join(shadow_cfg.values()))
+            except Exception:
+                kbd_hook = 0
+
         write("热键注册: " + (", ".join(
-            f"{a}={hotkey_label(*specs[a])}" for a in wanted) or "无"))
+            f"{a}={hotkey_label(*specs[a])}" for a in wanted_reg) or "无"))
+        if shadow_cfg:
+            # 单独记一行:这一行存在 = 这些键原程序照常收到,本工具同时触发
+            write("键盘旁听(和原功能同时生效): " + ", ".join(
+                f"{a}={hotkey_label(m, v)}" for (m, v), a in shadow_cfg.items()))
         if mouse_map:
             # 单独记一行:不然日志里只有键盘键,"侧键没反应"就无从查起
             write("鼠标侧键: " + ", ".join(
@@ -705,6 +821,8 @@ class HotkeyManager(QObject):
         finally:
             # 退出清理。注意:不能持 self._lock —— _stop_thread 持锁 join
             # 本线程,这里抢锁会死锁。
+            if kbd_hook:
+                UnhookWindowsHookEx(kbd_hook)
             if hook_id:
                 UnhookWindowsHookEx(hook_id)
             for hid in list(local_map):

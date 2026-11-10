@@ -16,7 +16,7 @@ from ..config import Config
 from ..core import protect, win32
 from ..core.classify import TYPE_LABELS, classify_window
 from ..core.hide import HideController
-from ..core.hotkeys import HotkeyManager, plan_hotkeys
+from ..core.hotkeys import HotkeyManager, hotkey_label, plan_hotkeys
 from ..core.targets import TargetRule, resolve_target_hwnds
 from ..core.win32 import WindowInfo
 from .settings_dialog import SettingsDialog
@@ -592,14 +592,18 @@ class MainWindow(QMainWindow):
         """把配置算成注册表并重启热键线程。规则全在 plan_hotkeys() 里。"""
         plan = plan_hotkeys(self._config)
         from ..log import write
-        if plan.unsafe:
-            write(f"拒绝注册 {len(plan.unsafe)} 个危险热键(纯 Shift 组合会"
-                  f"抢走换行/大写/符号输入),已按未设置处理")
+        if plan.shadow:
+            # 这些组合**不独占** —— 原程序照常收到,本工具同时触发。
+            # 用户明确要的就是这个效果("Shift+Enter 挺好操作,同时触发也行"),
+            # 所以这里不是警告,是告诉他"哪些键在双份生效"。
+            write("旁听热键(原功能照常 + 同时触发本工具): "
+                  + ", ".join(f"{a}={hotkey_label(*v)}"
+                              for a, v in plan.shadow.items()))
         if plan.merged:
             write(f"{' 和 '.join(plan.merged)}的「隐藏键」与「恢复键」是同一个,"
                   f"已按切换键处理(按一下藏、再按一下恢复)")
-        # 键盘组合与鼠标侧键**并存**:手在哪边用哪边
-        self._hotkeys.set_hotkeys(plan.specs, plan.mouse)
+        # 键盘组合、旁听组合与鼠标侧键**并存**:手在哪边用哪边
+        self._hotkeys.set_hotkeys(plan.specs, plan.mouse, plan.shadow)
 
     # ---------------------------------------------------------------- 信号
     def _on_hotkey(self, action: str) -> None:

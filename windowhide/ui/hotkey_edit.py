@@ -9,9 +9,12 @@
   成了"确定",Shift+Enter 真就成了老板键。
 - **Esc 只取消录入,不关对话框**。用户按两下 Esc 就退出设置,还以为
   "取消"能救回来,其实那一刻捕获态已经漏了一地。
-- **纯 Shift 组合一律拒绝**。Shift+Enter 是聊天换行、Shift+字母是大写、
-  Shift+数字是符号。这类组合一旦被 RegisterHotKey 注册,全系统就再也
-  用不了 —— 用户就是这么踩的,描述是"键盘和鼠标像坏了一样"。
+- **纯 Shift 组合不再拒绝,只是提醒**。Shift+Enter 是聊天换行、Shift+字母
+  是大写、Shift+数字是符号 —— 这类组合**不会**交给 RegisterHotKey(那是系统
+  层截获,原程序就再也收不到),而是走键盘钩子旁听:照样换行,同时也触发
+  本工具的动作。用户明确说过要的就是这个("shift 加 enter 特别好操作,
+  同时触发也可以,提醒一下就行")。只有"单个字母/数字/空格"仍然拒收 ——
+  那不是"随意",是每次打字都在触发。
 - **鼠标侧键可以直接按**。它不需要也没有修饰符。侧键消息只投递给光标
   下的窗口,所以走钩子转发而不是 Qt 事件(见 core/hotkeys.py)。
 """
@@ -89,9 +92,25 @@ def qt_event_to_spec(event: QKeyEvent) -> HotkeySpec | None:
     if key in _MODIFIER_KEYS:
         return None
     vk = _qtkey_to_vk(key)
-    if not mods or not vk:
+    if not vk:
+        return None
+    if not mods and not _bare_key_ok(vk):
+        # 单个字母/数字/空格/Enter 当全局热键 = 每次打字都藏窗口,
+        # 那不是"随意",是没法用。继续等用户补一个修饰键。
         return None
     return HotkeySpec(mods=mods, vk=vk)
+
+
+def _bare_key_ok(vk: int) -> bool:
+    """不带任何修饰键时,哪些键可以单独当热键。
+
+    只放行"平时没有输入语义"的键:功能键区 F1-F24,以及 Pause /
+    ScrollLock / Insert。这类键单独按下去不会往任何输入框里塞字符,
+    也就不会和正常打字打架。
+    """
+    if 0x70 <= vk <= 0x87:          # F1 - F24
+        return True
+    return vk in (0x13, 0x91, 0x2D)  # Pause / ScrollLock / Insert
 
 
 def _qtkey_to_vk(key: int) -> int:
@@ -224,13 +243,11 @@ class HotkeyCaptureButton(QPushButton):
 
         spec = qt_event_to_spec(event)
         if spec is None:
-            # 映射不到的键(多媒体键之类)。静默继续等,不要弹提示吓人
+            # 映射不到的键(多媒体键之类),或者"单个字母/数字"这种真不能用
+            # 的组合。静默继续等,不要弹提示吓人
             return
-        if not spec.safe:
-            # 纯 Shift 组合:Shift+Enter 换行、Shift+字母大写、Shift+数字
-            # 出符号,这些是全系统都要用的,注册成老板键等于把键盘废掉
-            self.setText("不能用纯 Shift 组合(会抢走换行/大写/符号)")
-            return
+        # 纯 Shift / 单个功能键:照收。它会被安排走"旁听"模式(原功能照常 +
+        # 同时触发),设置页会实时提示这件事 —— 不拒绝,只是说清楚。
         self._accept(spec)
 
     def mousePressEvent(self, event) -> None:

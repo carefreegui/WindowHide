@@ -46,16 +46,16 @@ MUTE_MODE_LABELS = {
 }
 
 
-# 全局热键的"安全修饰键"。
+# 全局热键的"独占修饰键"。
 #
-# 这是硬约束,不是偏好:`RegisterHotKey` 一旦注册成功,这个组合在**全系统**
-# 就被本程序截胡了 —— 文字输入、换行、公式填充统统失灵,而且用户很难想到
-# 是一个后台小工具干的。只有带 Ctrl/Alt/Win 的组合才安全,因为这些组合
-# 本来就不是任何程序的输入刚需,用户主动设了就是明确表达"我要这个"。
+# 带这些修饰键的组合会交给 `RegisterHotKey` —— 它是**系统层截获**,注册成功
+# 之后这个组合在全系统就归本程序了。好在 Ctrl/Alt/Win 组合本来就不是任何
+# 程序的输入刚需,用户主动设了就是明确表达"我要这个"。
 #
-# MOD_SHIFT **不算**安全:Shift+Enter 是聊天软件换行、Shift+字母是大写、
-# Shift+数字是符号。曾经真的让用户把 Shift+Enter 存成了老板键,结果整个
-# 键盘的换行和符号输入都"像坏了一样"。
+# **不带**它们的组合(纯 Shift、单个 F 键)不再拒绝,但也不走 RegisterHotKey
+# —— 那条路会把 Shift+Enter 的换行、Shift+字母的大写一起废掉。这类组合改走
+# 键盘钩子"旁听":照常放行给下面的程序,同时也触发本工具的动作。用户原话:
+# 「Shift+Enter 挺好操作,稍微占用一点也没关系,同时触发也可以,提醒一下就行」。
 SAFE_MODS = MOD_ALT | MOD_CONTROL | MOD_WIN
 
 
@@ -70,7 +70,7 @@ class HotkeySpec:
 
     @property
     def safe(self) -> bool:
-        """这个组合会不会把全系统的正常输入吃掉。"""
+        """会不会走 `RegisterHotKey`(独占)。True = 独占,False = 旁听。"""
         # 鼠标侧键本身就是"一个按键",没有修饰符可用 —— 必须放行,
         # 否则录进来的侧键会被当成无效配置直接丢掉(用户表现为"设了没反应")
         if self.is_mouse:
@@ -80,10 +80,22 @@ class HotkeySpec:
         return (self.mods & SAFE_MODS) != 0
 
     @property
-    def valid(self) -> bool:
-        if not self.vk:
+    def shadow(self) -> bool:
+        """要不要走"旁听"模式(键盘下级钩子,只看不拦)。
+
+        纯 Shift 组合和单个功能键都属于这一类。**不是拒绝** —— 用户明确
+        要求这类组合能用,只是必须换机制:RegisterHotKey 一旦注册成功,
+        原程序就再也收不到这个键(换行没了、大写没了);钩子可以只旁听,
+        原功能和本工具的动作同时发生。
+        """
+        if self.is_mouse or not self.vk:
             return False
-        return self.safe
+        return (self.mods & SAFE_MODS) == 0
+
+    @property
+    def valid(self) -> bool:
+        """有键就算有效。危险组合不再判无效 —— 它们只是换条路走。"""
+        return bool(self.vk)
 
     def to_dict(self) -> dict:
         return {"mods": self.mods, "vk": self.vk}
@@ -391,32 +403,30 @@ class Config:
         except OSError:
             pass
 
-    # ------------------------------------------------------------ 热键自愈
+    # ------------------------------------------------------------ 旁听热键
     _HOTKEY_FIELDS = (
         "hotkey_toggle", "hotkey_hide", "hotkey_restore", "hotkey_hide_self",
         "hotkey_toggle_mouse", "hotkey_hide_mouse", "hotkey_restore_mouse",
     )
 
-    def repair_unsafe_hotkeys(self) -> list[tuple[str, HotkeySpec, HotkeySpec]]:
-        """把会吃掉全系统输入的组合换回安全默认值,返回 (字段, 旧值, 新值)。
+    def shadow_hotkeys(self) -> list[tuple[str, HotkeySpec]]:
+        """列出会走"旁听"模式的组合(纯 Shift / 单个功能键)。
 
-        为什么必须在**加载时**修,而不是只在录入时拦:
-        老配置里可能已经躺着 Shift+Enter(用户就是这么踩的)。程序每次启动
-        都会照着它去 RegisterHotKey —— 一开机就把整个系统的"换行"和
-        "打符号"抢走,而这时候用户根本不在设置界面,连是哪个软件干的都
-        想不到。自愈一次,代价是用户换回默认键;不自愈,代价是他以为
-        电脑坏了。
+        🔴 这里**不再改写配置**。以前这函数叫 `repair_unsafe_hotkeys()`,
+        会把盘上的 Shift+Enter 强制换回默认键 —— 当时的理由是"一开机就把
+        系统换行抢走,用户根本想不到是谁干的"。但用户后来明确提出:这类
+        组合他就是要用,提醒一下就行。硬拦等于把他的选择权拿走了,而且
+        用户每次启动都可能撞上"我设的键怎么又变了"。
+
+        现在改成:照用,但换成不截获的机制(见 `HotkeySpec.shadow`),再把
+        这件事写进日志 + 设置页提示。真正的风险由机制消掉,而不是由拒绝消掉。
         """
-        defaults = type(self)()
-        broken: list[tuple[str, HotkeySpec, HotkeySpec]] = []
+        out: list[tuple[str, HotkeySpec]] = []
         for key in self._HOTKEY_FIELDS:
             spec = getattr(self, key, None)
-            if not isinstance(spec, HotkeySpec) or spec.safe:
-                continue
-            new = getattr(defaults, key)
-            broken.append((key, spec, HotkeySpec(mods=new.mods, vk=new.vk)))
-            setattr(self, key, HotkeySpec(mods=new.mods, vk=new.vk))
-        return broken
+            if isinstance(spec, HotkeySpec) and spec.shadow:
+                out.append((key, spec))
+        return out
 
     @classmethod
     def load(cls) -> "Config":
@@ -428,13 +438,11 @@ class Config:
         except (OSError, json.JSONDecodeError, ValueError):
             return cls()
         cfg = cls.from_dict(raw)
-        broken = cfg.repair_unsafe_hotkeys()
-        if broken:
+        shadows = cfg.shadow_hotkeys()
+        if shadows:
             from .log import write
-            write("已自动修正危险热键(这类组合会抢走全系统的输入,不该当全局热键): "
-                  + ", ".join(f"{k}={_spec_text(old)}→{_spec_text(new)}"
-                              for k, old, new in broken))
-            cfg.save()
+            write("这些热键走「旁听」模式(原程序照常收到,本工具也同时触发): "
+                  + ", ".join(f"{k}={_spec_text(s)}" for k, s in shadows))
         try:
             version = int(raw.get("version") or 1)
         except (TypeError, ValueError):

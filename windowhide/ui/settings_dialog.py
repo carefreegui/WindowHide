@@ -15,7 +15,7 @@ from ..config import (Config, MUTE_ALWAYS, MUTE_INHERIT,
                       MUTE_MODE_LABELS, MUTE_MODES, Profile)
 from ..core.protect import BUILTIN
 from ..core.targets import TargetRule
-from ..core.hotkeys import reset_capture
+from ..core.hotkeys import hotkey_label, reset_capture
 from ..core.win32 import ReleaseCapture
 from .hotkey_edit import HotkeyCaptureButton
 
@@ -179,9 +179,23 @@ class SettingsDialog(QDialog):
         self._lbl_same_hint.setWordWrap(True)
         self._lbl_same_hint.setStyleSheet("color: #0f766e;")
         v.addWidget(self._lbl_same_hint)
+
+        # 「这个组合不带 Ctrl/Alt/Win,会和原功能同时生效」的实时提示。
+        # 用琥珀色,和上面那条"两格相同"(青色,是解释)区分开 —— 这条是
+        # 真正需要用户看一眼的代价,不是补充说明。
+        self._lbl_shadow_hint = QLabel()
+        self._lbl_shadow_hint.setWordWrap(True)
+        self._lbl_shadow_hint.setStyleSheet("color: #b45309;")
+        self._lbl_shadow_hint.setVisible(False)
+        v.addWidget(self._lbl_shadow_hint)
+
         for cap in (self._cap_hide, self._cap_restore,
                     self._cap_hide_mouse, self._cap_restore_mouse):
             cap.captured.connect(self._refresh_same_hint)
+        # 主键/切换键的变化也要刷新"同时生效"提示(它不参与"两格相同",
+        # 但同样可能是纯 Shift 组合)。「隐藏本工具」那一格在下面创建,
+        # 单独连。
+        self._cap_toggle.captured.connect(self._refresh_shadow_hint)
         # 模式切换时显隐行:选"单一"只显示切换键,
         # 选"两个"才出现隐藏键/恢复键(旧版三个框并列,填了不生效,纯误导)
         self._mode_toggle.toggled.connect(self._sync_hotkey_rows)
@@ -193,6 +207,7 @@ class SettingsDialog(QDialog):
         extra = QGroupBox("附加")
         ev = QVBoxLayout(extra)
         self._cap_self = HotkeyCaptureButton(self._config.hotkey_hide_self)
+        self._cap_self.captured.connect(self._refresh_shadow_hint)
         row = QHBoxLayout()
         row.addWidget(QLabel("隐藏本工具(收进托盘):"))
         row.addWidget(self._cap_self)
@@ -201,10 +216,11 @@ class SettingsDialog(QDialog):
         tip = QLabel("「隐藏本工具」= 把本工具主窗口收进系统托盘(不是藏别人窗口),"
                      "与点右上角叉号等效;双击托盘图标可唤回。\n"
                      "全局快捷键在系统任意界面生效;若被其它软件占用,换一个组合即可。\n\n"
-                     "为什么必须带 Ctrl / Alt / Win:全局快捷键在系统里是"
-                     "「独占」的 —— 一旦生效,这个组合在别的程序里就再也不能用了。"
-                     "Shift+Enter 是聊天换行、Shift+字母是大写、Shift+数字是符号,"
-                     "这类组合本工具会直接拒绝(不是坏了),否则整台电脑的键盘会像坏了一样。\n\n"
+                     "带 Ctrl / Alt / Win 的:这类组合在系统里是「独占」的 —— 一旦生效,"
+                     "这个组合在别的程序里就再也不能用了(想占用也行,本工具会真的抢过来)。\n"
+                     "不带这三个键的(Shift+Enter、单个 F8):不独占,本工具只是「旁听」"
+                     "—— 原功能照常,同时触发隐藏/恢复。代价是同一个键在别处也会顺手"
+                     "触发一次,所以配不常用的键更舒服(Shift+F8 就比 Shift+Enter 稳)。\n\n"
                      "鼠标侧键:点右边那一格,然后直接按侧键。键盘组合键和侧键"
                      "各一个,同时生效 —— 手在哪边就用哪边。\n"
                      "注意:设成快捷键的那个侧键,以后在浏览器里不再「前进/后退」"
@@ -237,20 +253,50 @@ class SettingsDialog(QDialog):
             return
         if not self._mode_split.isChecked():
             self._lbl_same_hint.setText("")
-            return
-        same = []
-        if (self._cap_hide.spec().vk
-                and self._cap_hide.spec() == self._cap_restore.spec()):
-            same.append("键盘组合键")
-        if (self._cap_hide_mouse.spec().vk
-                and self._cap_hide_mouse.spec() == self._cap_restore_mouse.spec()):
-            same.append("鼠标侧键")
-        if same:
-            self._lbl_same_hint.setText(
-                f"{' 和 '.join(same)} 这两格填的是同一个 —— 保存后它会变成"
-                "「切换键」:按一下隐藏、再按一下恢复。想分别控制就填两个不同的键。")
         else:
-            self._lbl_same_hint.setText("")
+            same = []
+            if (self._cap_hide.spec().vk
+                    and self._cap_hide.spec() == self._cap_restore.spec()):
+                same.append("键盘组合键")
+            if (self._cap_hide_mouse.spec().vk
+                    and self._cap_hide_mouse.spec() == self._cap_restore_mouse.spec()):
+                same.append("鼠标侧键")
+            if same:
+                self._lbl_same_hint.setText(
+                    f"{' 和 '.join(same)} 这两格填的是同一个 —— 保存后它会变成"
+                    "「切换键」:按一下隐藏、再按一下恢复。想分别控制就填两个不同的键。")
+            else:
+                self._lbl_same_hint.setText("")
+        self._refresh_shadow_hint()
+
+    def _refresh_shadow_hint(self) -> None:
+        """把"这个组合会同时生效"说清楚。
+
+        纯 Shift 组合(以及单个 F 键)不走 RegisterHotKey,而是被键盘钩子
+        **旁听**:原程序照常收到这个键,本工具也同时触发。用户要的就是这个,
+        但他必须知道代价 —— 比如把隐藏设成 Shift+Enter,那以后在聊天框里
+        每换一次行,窗口就被藏一次。这类事只能在设的当场说,不能等他发现
+        "怎么打个字窗口就没了"再回来问。
+        """
+        lbl = getattr(self, "_lbl_shadow_hint", None)
+        if lbl is None:
+            return
+        # 「隐藏本工具」那一格在下面才创建 —— 首次刷新时它还不存在,
+        # 所以用 getattr 兜着,不能假设顺序。
+        caps = [c for c in (self._cap_toggle, self._cap_hide, self._cap_restore,
+                            getattr(self, "_cap_self", None)) if c is not None]
+        hit = [c for c in caps if c.spec().shadow]
+        if not hit:
+            lbl.setText("")
+            lbl.setVisible(False)
+            return
+        names = "、".join(hotkey_label(c.spec().mods, c.spec().vk) for c in hit)
+        lbl.setText(
+            f"「{names}」不带 Ctrl / Alt / Win —— 保存后它会「同时生效」:"
+            "原本的功能照常(例如 Enter 照样换行),本工具也同时执行动作。"
+            "好处是不抢占系统输入;代价是这个键在别处也会顺手触发一次,"
+            "选不常用的键(比如 Shift+F8)会舒服很多。")
+        lbl.setVisible(True)
 
     def _behavior_tab(self) -> QWidget:
         w = QWidget()
